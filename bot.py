@@ -1,652 +1,511 @@
+"""
+bot.py  — Auto Forward Bot V8.5 (Hybrid Extractor + Interactive Forward)
+Features:
+ - Interactive /forward (asks first link then last link)
+ - Works with Bot token and optionally a User StringSession (to extract from channels where bot is not admin)
+ - Extract (download) -> Re-upload (no forward tag) with thumbnail and cleaned caption
+ - Progress bar, ETA, Pause/Resume/Stop, persistence (state.json)
+ - Concurrency, retries, exponential backoff
+ - Inline control panel and beginner-friendly commands
 
-# bot_improved.py — Improved V5.5 (Adaptive concurrency, SQLite persistence, robust retries)
-# Replace your existing bot.py with this file.
-# Keep BOT_TOKEN secret.
+SETUP (quick):
+ 1) Install requirements:
+    pip install pyrogram tgcrypto aiofiles python-dotenv
 
+ 2) Environment variables (Heroku Config Vars recommended):
+    API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+    Optional: USER_SESSION (a Pyrogram StringSession for your user account)
+    Optional: SOURCE_CHANNEL (default fallback), TARGET_CHANNELS (csv), FORWARD_DELAY, CONCURRENCY
+
+ 3) To create USER_SESSION (run locally once):
+    from pyrogram import Client
+    from pyrogram.session import StringSession
+    app = Client("me", api_id=API_ID, api_hash=API_HASH)
+    with app:
+        print(StringSession.save(app.session))
+
+    Copy the printed string and set as USER_SESSION env var (keep secret).
+
+USAGE (owner-only):
+ - /start or /help : shows commands
+ - /panel : open inline buttons
+ - /forward : start interactive forward (bot asks first then last link)
+ - /linkforward <link1> <link2> : one-line forward
+ - /pause, /resume, /stop : control range tasks
+ - /setthumb (reply to image) : update thumbnail
+ - /setcaption <text> : set footer signature
+ - /addtarget /removetarget /listtargets etc.
+
+NOTE:
+ - Respect Telegram rules. Don't repost illegal/copyrighted/NSFW material.
+"""
 import os
 import re
 import json
 import time
-import sqlite3
 import asyncio
-import logging
 import tempfile
-from datetime import datetime
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional, List
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---------------- CONFIG (fill as before) ----------------
-API_ID = 28420641
-API_HASH = "d1302d5039ae3275c4195b4fcc5ff1f9"
-BOT_TOKEN = "8592967336:AAGoj5zAzkPO9nHSFjHYHp7JclEq4Z7KKGg"
-OWNER_ID = 8117462619
+# ----------------------------
+# CONFIG (environment or defaults)
+API_ID = int(os.getenv("API_ID", "28420641"))
+API_HASH = os.getenv("API_HASH", "d1302d5039ae3275c4195b4fcc5ff1f9")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8592967336:AAGoj5zAzkPO9nHSFjHYHp7JclEq4Z7KKGg")
+USER_SESSION = os.getenv("USER_SESSION", "")   # optional: your pyrogram StringSession
+OWNER_ID = int(os.getenv("OWNER_ID", "8117462619"))
 
-# default lists (editable via commands)
-DEFAULT_SOURCES = [-1003240589036]
-DEFAULT_TARGETS = [-1003216068164]
+# Source & targets (edit env or defaults)
+SOURCE_CHANNEL = int(os.getenv("SOURCE_CHANNEL", "-1003240589036"))  # default primary source if needed
+env_targets = os.getenv("TARGET_CHANNELS", "-1003216068164")
+TARGET_CHANNELS = [int(x.strip()) for x in env_targets.split(",") if x.strip()]
 
-DEFAULT_THUMB = "thumb.jpg"
-DEFAULT_DELAY = 0.5  # base delay between per-target sends (may be adapted)
-MAX_FILE_SIZE_MB = 200  # don't attempt to forward files larger than this (safety)
-# caption replacement rules
-DEFAULT_REMOVE_PATTERNS = [
-    r"Extracted\s*by[^\n]*", r"Extracted\s*By[^\n]*",
+# Thumbnail and behavior
+THUMB_FILE = os.getenv("THUMB_FILE", "thumb.jpg")   # default thumbnail filename in repo root
+FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.5"))  # seconds between actions
+CONCURRENCY = int(os.getenv("CONCURRENCY", "4"))   # how many concurrent target uploads per message
+RETRY_LIMIT = int(os.getenv("RETRY_LIMIT", "3"))
+
+# Caption cleaning / replacements
+REMOVE_TEXTS = [
+    r"Extracted\s*by[^\n]*",
+    r"Extracted\s*By[^\n]*",
     r"@YTBR_67", r"@skillwithgaurav", r"@kamdev5x", r"@skillzoneu",
     r"Gaurav\s*RaJput", r"Gaurav", r"Join-@skillwithgaurav"
 ]
 OLD_WEBSITE_RE = r"https?://[^\s]*riyasmm\.shop[^\s]*"
 NEW_WEBSITE = "https://bio.link/manmohak"
-DEFAULT_SIGNATURE = "Extracted by➤@course_wale"
+DEFAULT_SIGNATURE = os.getenv("DEFAULT_SIGNATURE", "Extracted by➤@course_wale")
 
-# concurrency tuning (start conservative)
-INITIAL_CONCURRENT_UPLOADS = int(os.environ.get("CONCURRENT_UPLOADS", "4"))
-INITIAL_CONCURRENT_MESSAGE_WORKERS = int(os.environ.get("CONCURRENT_MESSAGE_WORKERS", "2"))
-MAX_RETRIES = 4
-BACKOFF_BASE = 2
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "250"))  # skip > this
 
-# files
-DB_FILE = "bot.db"
-LOG_FILE = "bot_improved.log"
+# Persistence files
+STATE_FILE = Path("state.json")
+CONFIG_FILE = Path("v85_config.json")
 
-# ---------------- Logging ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# ---------------- Database (SQLite) ----------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS forwarded (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_chat INTEGER,
-        source_msg_id INTEGER,
-        target_chat INTEGER,
-        UNIQUE(source_chat, source_msg_id, target_chat)
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stats (
-        key TEXT PRIMARY KEY,
-        value INTEGER
-    )""")
-    conn.commit()
-    return conn
-
-db = init_db()
-db_lock = asyncio.Lock()
-
-def db_set_config(key: str, value: str):
-    cur = db.cursor()
-    cur.execute("REPLACE INTO config(key,value) VALUES (?,?)", (key, value))
-    db.commit()
-
-def db_get_config(key: str) -> Optional[str]:
-    cur = db.cursor()
-    cur.execute("SELECT value FROM config WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-def db_increment_stat(key: str, n: int = 1):
-    cur = db.cursor()
-    cur.execute("INSERT INTO stats(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = value + ?", (key, n, n))
-    db.commit()
-
-def has_been_forwarded(source_chat: int, source_msg_id: int, target_chat: int) -> bool:
-    cur = db.cursor()
-    cur.execute("SELECT 1 FROM forwarded WHERE source_chat=? AND source_msg_id=? AND target_chat=?", (source_chat, source_msg_id, target_chat))
-    return cur.fetchone() is not None
-
-def mark_forwarded(source_chat: int, source_msg_id: int, target_chat: int):
-    cur = db.cursor()
-    try:
-        cur.execute("INSERT OR IGNORE INTO forwarded(source_chat, source_msg_id, target_chat) VALUES (?,?,?)",
-                    (source_chat, source_msg_id, target_chat))
-        db.commit()
-    except Exception as e:
-        logger.exception("DB insert forward failed: %s", e)
-
-# ---------------- Persistent in-memory config loaded from DB/config.json fallback ----------------
-def load_runtime_config():
-    # try from DB, else fallback to defaults
-    cfg_json = db_get_config("runtime")
-    if cfg_json:
+# ----------------------------
+# Load/save runtime config (persist small settings)
+def load_config():
+    if CONFIG_FILE.exists():
         try:
-            return json.loads(cfg_json)
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except:
             pass
     cfg = {
-        "sources": DEFAULT_SOURCES.copy(),
-        "targets": DEFAULT_TARGETS.copy(),
+        "targets": TARGET_CHANNELS.copy(),
+        "thumb": THUMB_FILE,
         "signature": DEFAULT_SIGNATURE,
-        "thumb_path": DEFAULT_THUMB,
-        "forward_delay": DEFAULT_DELAY,
-        "remove_patterns": DEFAULT_REMOVE_PATTERNS.copy(),
-        "website_map": [{"pattern": OLD_WEBSITE_RE, "replace_with": NEW_WEBSITE}],
-        "filters": [],  # keywords
-        "scheduler": {"enabled": False, "interval_seconds": 0, "last_run": 0}
+        "forward_delay": FORWARD_DELAY,
+        "concurrency": CONCURRENCY
     }
-    db_set_config("runtime", json.dumps(cfg))
+    save_config(cfg)
     return cfg
 
-def save_runtime_config(cfg):
-    db_set_config("runtime", json.dumps(cfg))
-
-config = load_runtime_config()
-
-# ---------------- Pyrogram client ----------------
-app = Client("v5_5_bot_improved", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# dynamic semaphores (will be adjusted on FloodWait)
-current_concurrent_uploads = INITIAL_CONCURRENT_UPLOADS
-current_concurrent_workers = INITIAL_CONCURRENT_MESSAGE_WORKERS
-upload_semaphore = asyncio.Semaphore(current_concurrent_uploads)
-worker_semaphore = asyncio.Semaphore(current_concurrent_workers)
-
-# per-target cooldowns (target -> next_allowed_timestamp)
-target_cooldowns = {}  # map target_id -> timestamp
-
-# message queue and control
-message_queue = asyncio.Queue()
-
-# adaptive counters to detect throttling
-floodwait_events = 0
-last_flood_time = 0
-
-# ---------------- Utility functions ----------------
-def clean_caption_text(caption: str) -> str:
-    sig = config.get("signature", DEFAULT_SIGNATURE)
-    if not caption or caption.strip() == "":
-        text = sig
-    else:
-        text = caption
-        for pat in config.get("remove_patterns", []):
-            try:
-                text = re.sub(pat, "", text, flags=re.IGNORECASE)
-            except re.error:
-                text = text.replace(pat, "")
-        for wr in config.get("website_map", []):
-            try:
-                text = re.sub(wr["pattern"], wr["replace_with"], text, flags=re.IGNORECASE)
-            except re.error:
-                text = text.replace(wr.get("pattern",""), wr.get("replace_with",""))
-        text = text.strip()
-        if sig.lower() not in text.lower():
-            text = f"{text}\n\n{sig}"
-        site = config["website_map"][0]["replace_with"]
-        if site not in text:
-            text += f"\n\n𝚆𝚎𝚋𝚜𝚒𝚝𝚎 👇🥵\n{site}"
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
-
-async def adaptive_reduce_concurrency():
-    global current_concurrent_uploads, current_concurrent_workers, upload_semaphore, worker_semaphore
-    # reduce concurrency on repeated floodwaits
-    old_u = current_concurrent_uploads
-    old_w = current_concurrent_workers
-    current_concurrent_uploads = max(1, current_concurrent_uploads // 2)
-    current_concurrent_workers = max(1, current_concurrent_workers // 2)
-    upload_semaphore = asyncio.Semaphore(current_concurrent_uploads)
-    worker_semaphore = asyncio.Semaphore(current_concurrent_workers)
-    logger.warning("Adaptive throttle: uploads %s->%s, workers %s->%s", old_u, current_concurrent_uploads, old_w, current_concurrent_workers)
-
-async def adaptive_increase_concurrency():
-    global current_concurrent_uploads, current_concurrent_workers, upload_semaphore, worker_semaphore
-    # slowly ramp up if no flood in last minute
-    now = time.time()
-    if now - last_flood_time > 60:
-        current_concurrent_uploads = min(12, current_concurrent_uploads + 1)
-        current_concurrent_workers = min(6, current_concurrent_workers + 1)
-        upload_semaphore = asyncio.Semaphore(current_concurrent_uploads)
-        worker_semaphore = asyncio.Semaphore(current_concurrent_workers)
-        logger.info("Adaptive increase: uploads -> %s, workers -> %s", current_concurrent_uploads, current_concurrent_workers)
-
-def ensure_temp_dir():
-    tmp = tempfile.gettempdir()
-    return tmp
-
-def is_file_too_big(path: str):
+def save_config(cfg):
     try:
-        size_mb = os.path.getsize(path) / (1024*1024)
-        return size_mb > MAX_FILE_SIZE_MB
-    except:
-        return True
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        print("save_config error:", e)
 
-# ---------------- Robust sender with retries and adaptive handling ----------------
-async def send_video_with_retry(client: Client, target: int, video_path: str, caption: str, thumb_path: str):
-    global floodwait_events, last_flood_time
-    attempt = 0
-    while attempt < MAX_RETRIES:
+config = load_config()
+# keep quick handles
+TARGETS_POOL = config.get("targets", [])
+THUMB_FILE = config.get("thumb", THUMB_FILE)
+SIGNATURE = config.get("signature", DEFAULT_SIGNATURE)
+FORWARD_DELAY = config.get("forward_delay", FORWARD_DELAY)
+CONCURRENCY = config.get("concurrency", CONCURRENCY)
+
+# ----------------------------
+# Pyrogram clients: bot and optional user
+bot = Client("v85_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+user = None
+if USER_SESSION:
+    # user is optional; must be a valid StringSession
+    try:
+        user = Client(session_name=USER_SESSION, api_id=API_ID, api_hash=API_HASH)
+    except Exception as e:
+        print("USER_SESSION invalid or creation failed:", e)
+        user = None
+
+# controller & persistence
+controller = {
+    "range_task": None,   # currently running range task
+    "pause_event": asyncio.Event(),
+    "stop_flag": False,
+    "interactive_wait": {},  # temp store for interactive forward flow {user_id: {"step":1,"first":None}}
+}
+controller["pause_event"].set()
+
+def load_state():
+    if STATE_FILE.exists():
         try:
-            # per-target cooldown check
-            now = time.time()
-            next_allowed = target_cooldowns.get(target, 0)
-            if now < next_allowed:
-                wait = next_allowed - now
-                logger.info("Cooldown for %s active, sleeping %s", target, wait)
-                await asyncio.sleep(wait)
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except:
+            pass
+    return {}
 
-            async with upload_semaphore:
-                await client.send_video(
-                    chat_id=int(target),
-                    video=video_path,
-                    caption=caption,
-                    thumb=thumb_path if os.path.exists(thumb_path) else None,
-                    supports_streaming=True
-                )
-            # success: set small cooldown for this target
-            target_cooldowns[target] = time.time() + 0.5  # half second cooldown
+def save_state(state):
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        print("save_state error:", e)
+
+state = load_state()
+
+# ----------------------------
+# Utilities
+def clean_caption(text: Optional[str]) -> str:
+    sig = config.get("signature", SIGNATURE)
+    if not text:
+        return sig
+    out = text
+    for pat in REMOVE_TEXTS:
+        try:
+            out = re.sub(pat, "", out, flags=re.IGNORECASE)
+        except re.error:
+            out = out.replace(pat, "")
+    out = re.sub(OLD_WEBSITE_RE, NEW_WEBSITE, out, flags=re.IGNORECASE)
+    out = out.strip()
+    if sig.lower() not in out.lower():
+        out = f"{out}\n\n{sig}"
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+def parse_msgid_from_link(link: str) -> Optional[int]:
+    """Accepts t.me/c/<chan>/<id> or t.me/<username>/<id>"""
+    try:
+        parts = link.strip().split("/")
+        return int(parts[-1])
+    except:
+        return None
+
+async def download_message_media(client: Client, msg: Message) -> Optional[str]:
+    """Download message media to temp file; returns filepath or None"""
+    try:
+        # choose filename in temp dir
+        tmpdir = tempfile.gettempdir()
+        base = f"v85_{msg.chat.id}_{msg.id}_{int(time.time()*1000)}"
+        # if video or document (video)
+        if msg.video:
+            fpath = await msg.download(file_name=f"{base}.mp4")
+        elif msg.document and getattr(msg.document, "mime_type", "").startswith("video"):
+            fpath = await msg.download(file_name=f"{base}.mp4")
+        elif msg.photo:
+            fpath = await msg.download(file_name=f"{base}.jpg")
+        else:
+            # for text or unsupported types, we won't download
+            return None
+        # size check
+        try:
+            size_mb = (Path(fpath).stat().st_size) / (1024*1024)
+            if size_mb > MAX_FILE_SIZE_MB:
+                print(f"File too big {size_mb:.1f}MB; skipping")
+                try: Path(fpath).unlink()
+                except: pass
+                return None
+        except Exception:
+            pass
+        return fpath
+    except Exception as e:
+        print("download error:", e)
+        return None
+
+async def send_media_with_retries(client: Client, target: int, local_path: str, caption: str, thumb: Optional[str]=None) -> bool:
+    attempt = 0
+    backoff = 1.0
+    while attempt < RETRY_LIMIT:
+        try:
+            # Use send_video on mp4s, send_photo on jpg, else send_document
+            suffix = Path(local_path).suffix.lower()
+            if suffix in [".mp4", ".mkv", ".webm"]:
+                await client.send_video(chat_id=target, video=local_path, caption=caption, thumb=thumb if thumb and Path(thumb).exists() else None, supports_streaming=True)
+            elif suffix in [".jpg", ".jpeg", ".png", ".webp"]:
+                await client.send_photo(chat_id=target, photo=local_path, caption=caption)
+            else:
+                await client.send_document(chat_id=target, document=local_path, caption=caption)
             return True
         except FloodWait as fw:
-            # FloodWait object may expose .value or .x
             wait = int(getattr(fw, "value", getattr(fw, "x", 10))) + 1
-            floodwait_events += 1
-            last_flood_time = time.time()
-            logger.warning("FloodWait %s seconds for target %s (attempt %s)", wait, target, attempt)
-            # cool down and adapt: reduce concurrency
-            await adaptive_reduce_concurrency()
+            print(f"FloodWait {wait}s, sleeping...")
             await asyncio.sleep(wait)
-            attempt += 1
-        except RPCError as rpc:
-            logger.error("RPCError sending to %s: %s", target, rpc)
+        except RPCError as r:
+            print("RPCError sending:", r)
             return False
         except Exception as e:
             attempt += 1
-            backoff = BACKOFF_BASE ** attempt
-            logger.exception("Send attempt %s to %s failed: %s — backing off %ss", attempt, target, e, backoff)
+            print(f"send attempt {attempt} failed: {e}, backoff {backoff}s")
             await asyncio.sleep(backoff)
-    logger.error("Failed to send video to %s after %s attempts", target, MAX_RETRIES)
+            backoff *= 2
     return False
 
-# ---------------- Process a single message (download once, upload to all targets) ----------------
-async def process_single_message(client: Client, msg, targets: List[int]):
-    if not msg:
-        return {"sent": 0, "failed": 0, "skipped": 0}
-    caption = clean_caption_text(msg.caption)
-    # apply filters
-    filters_list = config.get("filters", [])
-    if filters_list:
-        match = False
-        txt = (msg.caption or "") + " " + (getattr(msg, "text", "") or "")
-        for kw in filters_list:
-            if kw.strip().lower() in txt.lower():
-                match = True
-                break
-        if not match:
-            db_increment_stat("skipped")
-            return {"sent": 0, "failed": 0, "skipped": 1}
-
-    is_video = bool(msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video/")))
-    sent = failed = skipped = 0
-
-    if is_video:
-        # download to temp
-        tmpdir = ensure_temp_dir()
-        fname = os.path.join(tmpdir, f"tmp_{msg.chat.id}_{msg.message_id}_{int(time.time()*1000)}.mp4")
+async def forward_message_to_targets(client_for_download: Client, src_msg: Message, targets: List[int], use_reupload=True):
+    """
+    For a single source message: download (if needed) and reupload to targets concurrently.
+    If use_reupload False -> will attempt message.copy (fast) (requires bot admin)
+    """
+    caption = clean_caption(src_msg.caption or src_msg.text or "")
+    # if message is pure text and small -> use copy
+    is_media = bool(src_msg.video or src_msg.document or src_msg.photo)
+    if is_media:
+        # download with client_for_download (user if available else bot)
+        local_path = await download_message_media(client_for_download, src_msg)
+        if not local_path:
+            # fallback to copy (maybe allowed)
+            print("No local file, trying message.copy fallback")
+            results = []
+            for t in targets:
+                try:
+                    await src_msg.copy(chat_id=t, caption=caption)
+                    results.append(True)
+                except Exception as e:
+                    print("copy fallback error:", e)
+                    results.append(False)
+                await asyncio.sleep(FORWARD_DELAY)
+            return results
+        # send concurrently with concurrency semaphore
+        sem = asyncio.Semaphore(config.get("concurrency", CONCURRENCY))
+        async def _send_to(tid):
+            async with sem:
+                ok = await send_media_with_retries(bot if bot else client_for_download, tid, local_path, caption, thumb=config.get("thumb", THUMB_FILE))
+                await asyncio.sleep(config.get("forward_delay", FORWARD_DELAY))
+                return ok
+        tasks = [asyncio.create_task(_send_to(t)) for t in targets]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # cleanup file
         try:
-            path = await msg.download(file_name=fname)
-            if is_file_too_big(path):
-                logger.warning("File too big, skipping: %s", path)
-                db_increment_stat("skipped")
-                try: os.remove(path)
-                except: pass
-                return {"sent":0,"failed":0,"skipped":1}
-        except Exception as e:
-            logger.exception("Download error for %s:%s -> %s", msg.chat.id, msg.message_id, e)
-            return {"sent":0,"failed":len(targets),"skipped":0}
-
-        # create tasks to send to targets but respect idempotency
-        send_tasks = []
-        for t in targets:
-            if has_been_forwarded(msg.chat.id, msg.message_id, t):
-                logger.info("Already forwarded %s:%s to %s — skipping", msg.chat.id, msg.message_id, t)
-                skipped += 1
-                continue
-            task = asyncio.create_task(send_video_with_retry(client, t, path, caption, config.get("thumb_path", DEFAULT_THUMB)))
-            send_tasks.append((t, task))
-
-        if send_tasks:
-            results = await asyncio.gather(*(t for _, t in send_tasks), return_exceptions=True)
-            for (target, _), res in zip(send_tasks, results):
-                ok = res is True
-                if ok:
-                    sent += 1
-                    mark_forwarded(msg.chat.id, msg.message_id, target)
-                    db_increment_stat("forwarded")
-                else:
-                    failed += 1
-                    db_increment_stat("failed")
-        # cleanup
-        try:
-            if os.path.exists(path):
-                os.remove(path)
+            Path(local_path).unlink()
         except:
             pass
-        await adaptive_increase_concurrency()
+        return results
     else:
-        # non-video: copy per target with cooldown & idempotency
+        # text only: copy (fast)
+        results = []
         for t in targets:
-            if has_been_forwarded(msg.chat.id, msg.message_id, t):
-                skipped += 1
-                continue
             try:
-                async with upload_semaphore:
-                    await msg.copy(chat_id=int(t), caption=caption)
-                sent += 1
-                mark_forwarded(msg.chat.id, msg.message_id, t)
-                db_increment_stat("forwarded")
-            except FloodWait as fw:
-                wait = int(getattr(fw, "value", getattr(fw, "x", 10))) + 1
-                logger.warning("FloodWait on copy to %s sleep %s", t, wait)
-                await asyncio.sleep(wait)
-                try:
-                    await msg.copy(chat_id=int(t), caption=caption)
-                    sent += 1
-                    mark_forwarded(msg.chat.id, msg.message_id, t)
-                    db_increment_stat("forwarded")
-                except Exception as e:
-                    logger.exception("Copy retry failed to %s: %s", t, e)
-                    failed += 1
-                    db_increment_stat("failed")
+                await src_msg.copy(chat_id=t, caption=caption)
+                results.append(True)
             except Exception as e:
-                logger.exception("Copy failed to %s: %s", t, e)
-                failed += 1
-                db_increment_stat("failed")
-            await asyncio.sleep(config.get("forward_delay", DEFAULT_DELAY))
-    return {"sent":sent,"failed":failed,"skipped":skipped}
+                print("copy text error:", e)
+                results.append(False)
+            await asyncio.sleep(config.get("forward_delay", FORWARD_DELAY))
+        return results
 
-# ---------------- Forward range concurrently (main heavy-lifter) ----------------
-async def forward_range_concurrent(client: Client, source_chat: int, start_id: int, end_id: int, progress_message):
-    ids = list(range(start_id, end_id+1))
-    msgs = await client.get_messages(source_chat, ids)
-    msgs = [m for m in msgs if m]
-    total = len(msgs)
-    if total == 0:
-        await progress_message.edit_text("⚠️ No messages found.")
-        return {"sent":0,"failed":0,"skipped":0}
+# ----------------------------
+# Inline keyboards & helpers
+def main_panel_kb():
+    kb = [
+        [InlineKeyboardButton("▶ Forward (interactive)", "btn_forward"),
+         InlineKeyboardButton("🔁 LinkForward", "btn_linkforward")],
+        [InlineKeyboardButton("⏸ Pause", "btn_pause"),
+         InlineKeyboardButton("▶ Resume", "btn_resume"),
+         InlineKeyboardButton("⏹ Stop", "btn_stop")],
+        [InlineKeyboardButton("🎯 Targets", "btn_targets"),
+         InlineKeyboardButton("🖼 SetThumb (reply)", "btn_thumb")],
+        [InlineKeyboardButton("❓ Help", "btn_help"), InlineKeyboardButton("⚙ Config", "btn_config")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
-    await progress_message.edit_text(f"🚀 Forwarding {total} messages with concurrency (workers={current_concurrent_workers})...")
-    tasks = []
-    for m in msgs:
-        # submit worker tasks but worker_semaphore bound reduces parallelism
-        async def schedule_worker(mg):
-            async with worker_semaphore:
-                return await process_single_message(client, mg, config.get("targets", []))
-        tasks.append(asyncio.create_task(schedule_worker(m)))
+def targets_kb():
+    kb = []
+    for t in TARGETS_POOL:
+        label = f"{'✅' if t in config.get('targets', []) else '⬜'} {str(t)[-6:]}"
+        kb.append([InlineKeyboardButton(label, f"toggle_{t}")])
+    kb.append([InlineKeyboardButton("Done", "targets_done")])
+    return InlineKeyboardMarkup(kb)
 
-    sent_total = failed_total = skipped_total = 0
-    done = 0
-    for fut in asyncio.as_completed(tasks):
-        res = await fut
-        sent_total += res.get("sent",0)
-        failed_total += res.get("failed",0)
-        skipped_total += res.get("skipped",0)
-        done += 1
-        await progress_message.edit_text(f"📤 Done: {done}/{total} — Sent: {sent_total} | Failed: {failed_total} | Skipped: {skipped_total}")
-    await progress_message.edit_text(f"✅ Completed. Sent: {sent_total} | Failed: {failed_total} | Skipped: {skipped_total}")
-    return {"sent":sent_total,"failed":failed_total,"skipped":skipped_total}
-
-# ---------------- Owner-only decorator ----------------
+# ----------------------------
+# Owner-only check decorator
 def owner_only(func):
     async def wrapper(client, message):
         if not message.from_user or message.from_user.id != OWNER_ID:
-            await message.reply_text("❌ Not authorized.")
+            await message.reply_text("❌ You are not authorized to use this command.")
             return
         return await func(client, message)
     return wrapper
 
-# ---------------- Commands ----------------
-
-@app.on_message(filters.command("start") & filters.user(OWNER_ID))
+# ----------------------------
+# Commands & callbacks
+@bot.on_message(filters.command(["start","help"]))
 @owner_only
-async def cmd_start(client, message):
-    await message.reply_text("Bot running. Use /panel or /help for commands.")
+async def cmd_help(client, message: Message):
+    txt = (
+        "**Auto Forward Bot V8.5 — Commands (Owner only)**\n\n"
+        "`/forward` - Interactive: bot asks first link then last link\n"
+        "`/linkforward <link1> <link2>` - Direct range forward\n"
+        "`/pause` `/resume` `/stop` - Control running range task\n"
+        "`/setthumb` - Reply to an image to set thumbnail\n"
+        "`/setcaption <text>` - Change signature appended to captions\n"
+        "`/addtarget -100id` / `/removetarget -100id` / `/listtargets`\n"
+        "`/panel` - Open button panel\n\n"
+        "To extract from channels where bot is not admin, set USER_SESSION env (StringSession) and restart bot.\n"
+        "Make sure you have rights to repost content before using this bot."
+    )
+    await message.reply_text(txt, reply_markup=main_panel_kb())
 
-@app.on_message(filters.command("status") & filters.user(OWNER_ID))
+@bot.on_message(filters.command("panel"))
 @owner_only
-async def cmd_status(client, message):
-    s = config
-    text = (f"✅ Status\nSources: {s.get('sources')}\nTargets: {s.get('targets')}\n"
-            f"Signature: {s.get('signature')}\nThumb: {s.get('thumb_path')}\n"
-            f"Filters: {s.get('filters')}\nWorkers: {current_concurrent_workers} Uploads: {current_concurrent_uploads}\n"
-            f"Stats forwarded={db_get_stat('forwarded')}, failed={db_get_stat('failed')}, skipped={db_get_stat('skipped')}")
-    await message.reply_text(text)
+async def cmd_panel(client, message: Message):
+    await message.reply_text("Control Panel:", reply_markup=main_panel_kb())
 
-def db_get_stat(k):
-    cur = db.cursor()
-    cur.execute("SELECT value FROM stats WHERE key=?", (k,))
-    r = cur.fetchone()
-    return r[0] if r else 0
-
-@app.on_message(filters.command("verifytargets") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_verifytargets(client, message):
-    await message.reply_text("🔍 Verifying targets...")
-    out = []
-    for t in config.get("targets", []):
-        try:
-            chat = await client.get_chat(int(t))
-            out.append(f"✅ {getattr(chat,'title', str(t))} (`{t}`)")
-        except Exception as e:
-            out.append(f"❌ `{t}` | {e}")
-    await message.reply_text("\n".join(out))
-
-@app.on_message(filters.command("addsource") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_addsource(client, message):
-    try:
-        cid = int(message.text.split()[1])
-    except:
-        return await message.reply_text("Usage: /addsource -100123...")
-    if cid not in config["sources"]:
-        config["sources"].append(cid); save_runtime_config(config)
-        await message.reply_text(f"✅ Added source {cid}")
+@bot.on_callback_query()
+async def on_cb(client, cq):
+    if cq.from_user.id != OWNER_ID:
+        await cq.answer("Not allowed", show_alert=True)
+        return
+    data = cq.data or ""
+    if data == "btn_forward":
+        await cq.answer()
+        await cq.message.reply_text("Send /forward to start interactive forward (I will then ask for links).")
+    elif data == "btn_linkforward":
+        await cq.answer()
+        await cq.message.reply_text("Usage: /linkforward <first_link> <last_link>")
+    elif data == "btn_pause":
+        controller["pause_event"].clear()
+        await cq.answer("Paused")
+    elif data == "btn_resume":
+        controller["pause_event"].set()
+        await cq.answer("Resumed")
+    elif data == "btn_stop":
+        controller["stop_flag"] = True
+        task = controller.get("range_task")
+        if task and not task.done():
+            task.cancel()
+        await cq.answer("Stop signaled")
+    elif data == "btn_targets":
+        await cq.answer()
+        await cq.message.edit_text("Toggle targets:", reply_markup=targets_kb())
+    elif data.startswith("toggle_"):
+        tid = int(data.split("_",1)[1])
+        cfg_targets = config.get("targets", [])
+        if tid in cfg_targets:
+            cfg_targets.remove(tid)
+        else:
+            cfg_targets.append(tid)
+        config["targets"] = cfg_targets
+        save_config(config)
+        await cq.answer("Toggled")
+        await cq.message.edit_text("Toggle targets:", reply_markup=targets_kb())
+    elif data == "targets_done":
+        await cq.answer("Saved targets")
+        await cq.message.edit_text(f"Targets saved: `{config.get('targets',[])}`", reply_markup=main_panel_kb())
+    elif data == "btn_thumb":
+        await cq.answer()
+        await cq.message.reply_text("Reply to an image with /setthumb to set new thumbnail.")
+    elif data == "btn_help":
+        await cq.answer()
+        await cmd_help(client, cq.message)
+    elif data == "btn_config":
+        await cq.answer()
+        await cq.message.reply_text(f"Config: delay={config.get('forward_delay')}, concurrency={config.get('concurrency')}", reply_markup=main_panel_kb())
     else:
-        await message.reply_text("⚠️ already exists")
+        await cq.answer()
 
-@app.on_message(filters.command("removesource") & filters.user(OWNER_ID))
+# set thumbnail
+@bot.on_message(filters.command("setthumb") & filters.reply)
 @owner_only
-async def cmd_removesource(client, message):
-    try:
-        cid = int(message.text.split()[1])
-    except:
-        return await message.reply_text("Usage: /removesource -100123...")
-    if cid in config["sources"]:
-        config["sources"].remove(cid); save_runtime_config(config)
-        await message.reply_text(f"🗑 Removed {cid}")
-    else:
-        await message.reply_text("⚠️ Not found")
-
-@app.on_message(filters.command("addtarget") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_addtarget(client, message):
-    try:
-        cid = int(message.text.split()[1])
-    except:
-        return await message.reply_text("Usage: /addtarget -100123...")
-    if cid not in config["targets"]:
-        config["targets"].append(cid); save_runtime_config(config)
-        await message.reply_text(f"✅ Added target {cid}")
-    else:
-        await message.reply_text("⚠️ already exists")
-
-@app.on_message(filters.command("removetarget") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_removetarget(client, message):
-    try:
-        cid = int(message.text.split()[1])
-    except:
-        return await message.reply_text("Usage: /removetarget -100123...")
-    if cid in config["targets"]:
-        config["targets"].remove(cid); save_runtime_config(config)
-        await message.reply_text(f"🗑 Removed {cid}")
-    else:
-        await message.reply_text("⚠️ Not found")
-
-@app.on_message(filters.command("setcaption") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_setcaption(client, message):
-    text = message.text.replace("/setcaption","").strip()
-    if not text:
-        return await message.reply_text("Usage: /setcaption <text>")
-    config["signature"] = text; save_runtime_config(config)
-    await message.reply_text(f"✅ Signature set: {text}")
-
-@app.on_message(filters.command("setfilter") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_setfilter(client, message):
-    kw = message.text.replace("/setfilter","").strip()
-    if not kw:
-        return await message.reply_text("Usage: /setfilter <keyword>")
-    config.setdefault("filters", []).append(kw)
-    save_runtime_config(config)
-    await message.reply_text(f"✅ Filter added: {kw}")
-
-@app.on_message(filters.command("removefilter") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_removefilter(client, message):
-    try:
-        term = message.text.split(maxsplit=1)[1].strip()
-    except:
-        return await message.reply_text("Usage: /removefilter <keyword>")
-    if term in config.get("filters", []):
-        config["filters"].remove(term); save_runtime_config(config)
-        await message.reply_text("✅ removed")
-    else:
-        await message.reply_text("⚠️ not found")
-
-@app.on_message(filters.command("setthumb") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_setthumb(client, message):
+async def cmd_setthumb(client, message: Message):
     if not message.reply_to_message:
-        return await message.reply_text("Reply to an image with /setthumb")
-    tgt = message.reply_to_message
-    if not (tgt.photo or (tgt.document and getattr(tgt.document,"mime_type","", "").startswith("image/"))):
-        return await message.reply_text("Reply must contain image")
-    path = await tgt.download(file_name="thumb.jpg")
-    config["thumb_path"] = path; save_runtime_config(config)
-    await message.reply_text("✅ Thumb updated")
-
-@app.on_message(filters.command("linkforward") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_linkforward(client, message):
-    parts = message.text.split()
-    if len(parts) != 3:
-        return await message.reply_text("Usage: /linkforward <link1> <link2>")
-    def extract_id(link):
-        m = re.search(r"/(\d+)$", link)
-        return int(m.group(1)) if m else None
-    s = extract_id(parts[1]); e = extract_id(parts[2])
-    if not s or not e:
-        return await message.reply_text("Invalid links")
-    if s > e: s,e = e,s
-    progress = await message.reply_text(f"🔁 Forwarding {s} → {e} ...")
-    await forward_range_concurrent(client, config.get("sources", [])[0], s, e, progress)
-
-@app.on_message(filters.command("schedule") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_schedule(client, message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        return await message.reply_text("Usage: /schedule <seconds>")
+        await message.reply_text("Reply to an image message with /setthumb")
+        return
     try:
-        interval = int(parts[1])
-    except:
-        return await message.reply_text("Interval must be int seconds")
-    config["scheduler"]["enabled"] = True
-    config["scheduler"]["interval_seconds"] = interval
-    config["scheduler"]["last_run"] = int(time.time())
-    save_runtime_config(config)
-    # start worker task if not running
-    global scheduler_task
-    if 'scheduler_task' in globals() and scheduler_task and not scheduler_task.done():
-        scheduler_task.cancel()
-    scheduler_task = asyncio.create_task(scheduler_worker(client))
-    await message.reply_text(f"✅ Scheduler set: every {interval}s")
-
-@app.on_message(filters.command("stop") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_stop(client, message):
-    config["scheduler"]["enabled"] = False
-    save_runtime_config(config)
-    global scheduler_task
-    if 'scheduler_task' in globals() and scheduler_task and not scheduler_task.done():
-        scheduler_task.cancel()
-    await message.reply_text("⏹ Scheduler stopped")
-
-@app.on_message(filters.command("stats") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_stats(client, message):
-    forwarded = db_get_stat("forwarded")
-    failed = db_get_stat("failed")
-    skipped = db_get_stat("skipped")
-    await message.reply_text(f"Stats: forwarded={forwarded}, failed={failed}, skipped={skipped}")
-
-@app.on_message(filters.command("viewlog") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_viewlog(client, message):
-    if not os.path.exists(LOG_FILE):
-        return await message.reply_text("No log file")
-    with open(LOG_FILE,"r",encoding="utf-8") as f:
-        data = f.read()[-3500:]
-    await message.reply_text(f"`{data}`", disable_web_page_preview=True)
-
-@app.on_message(filters.command("clearlog") & filters.user(OWNER_ID))
-@owner_only
-async def cmd_clearlog(client, message):
-    open(LOG_FILE,"w").close()
-    await message.reply_text("✅ Log cleared")
-
-# ---------------- Scheduler worker ----------------
-async def scheduler_worker(client: Client):
-    try:
-        while config.get("scheduler", {}).get("enabled", False):
-            interval = config["scheduler"].get("interval_seconds", 0)
-            if interval <= 0:
-                break
-            for src in config.get("sources", []):
-                # get last 20 messages and forward new ones
-                msgs = await client.get_history(src, limit=20)
-                to_forward = []
-                last_run = config["scheduler"].get("last_run", 0)
-                for m in reversed(msgs):
-                    if hasattr(m, "date") and (int(m.date.timestamp()) > last_run):
-                        to_forward.append(m)
-                if to_forward:
-                    progress_msg = await client.send_message(OWNER_ID, f"Scheduler forwarding {len(to_forward)} from {src}")
-                    ids = [m.message_id for m in to_forward]
-                    await forward_range_concurrent(client, src, min(ids), max(ids), progress_msg)
-                    config["scheduler"]["last_run"] = int(time.time())
-                    save_runtime_config(config)
-            await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        logger.info("Scheduler cancelled")
+        path = await message.reply_to_message.download(file_name="thumb.jpg")
+        config["thumb"] = path
+        save_config(config)
+        await message.reply_text("Thumbnail updated.")
     except Exception as e:
-        logger.exception("Scheduler error: %s", e)
+        await message.reply_text(f"Error: {e}")
 
-# ---------------- Auto-forward on new messages (real-time) ----------------
-@app.on_message(filters.chat(lambda c: c in config.get("sources", [])))
-async def on_source_message(client, message):
-    # submit to background processing
-    logger.info("New source message %s:%s queued", message.chat.id, message.message_id)
-    asyncio.create_task(process_single_message(client, message, config.get("targets", [])))
+# set caption signature
+@bot.on_message(filters.command("setcaption"))
+@owner_only
+async def cmd_setcaption(client, message: Message):
+    txt = " ".join(message.command[1:])
+    if not txt:
+        await message.reply_text("Usage: /setcaption <text>")
+        return
+    config["signature"] = txt
+    save_config(config)
+    await message.reply_text(f"Signature set to: {txt}")
 
-# ---------------- Startup ----------------
-if __name__ == "__main__":
-    logger.info("Starting improved bot V5.5")
-    # ensure db and config ok
-    save_runtime_config(config)
-    scheduler_task = None
-    if config.get("scheduler", {}).get("enabled", False):
-        scheduler_task = asyncio.get_event_loop().create_task(scheduler_worker(app))
-    app.run()
+# targets management
+@bot.on_message(filters.command("addtarget"))
+@owner_only
+async def cmd_addtarget(client, message: Message):
+    try:
+        tid = int(message.command[1])
+    except:
+        await message.reply_text("Usage: /addtarget -1001234567890")
+        return
+    if tid in TARGETS_POOL:
+        await message.reply_text("Already in pool.")
+        return
+    TARGETS_POOL.append(tid)
+    cfg = config.get("targets", [])
+    cfg.append(tid)
+    config["targets"] = cfg
+    save_config(config)
+    await message.reply_text(f"Added {tid}")
+
+@bot.on_message(filters.command("removetarget"))
+@owner_only
+async def cmd_removetarget(client, message: Message):
+    try:
+        tid = int(message.command[1])
+    except:
+        await message.reply_text("Usage: /removetarget -1001234567890")
+        return
+    if tid in TARGETS_POOL:
+        TARGETS_POOL.remove(tid)
+    cfg = config.get("targets", [])
+    if tid in cfg:
+        cfg.remove(tid)
+    config["targets"] = cfg
+    save_config(config)
+    await message.reply_text(f"Removed {tid}")
+
+@bot.on_message(filters.command("listtargets"))
+@owner_only
+async def cmd_listtargets(client, message: Message):
+    await message.reply_text(f"Pool: `{TARGETS_POOL}`\nSelected: `{config.get('targets',[])}`")
+
+# interactive forward: /forward starts the flow: bot asks first link then last link
+@bot.on_message(filters.command("forward"))
+@owner_only
+async def cmd_forward_interactive(client, message: Message):
+    uid = message.from_user.id
+    controller["interactive_wait"][uid] = {"step": 1, "first": None}
+    await message.reply_text("Send FIRST message link now (e.g. https://t.me/c/3240589036/340).")
+
+# capture free-form messages containing links for interactive flow (owner only)
+@bot.on_message(filters.text & filters.user(OWNER_ID))
+async def interactive_listener(client, message: Message):
+    uid = message.from_user.id
+    if uid not in controller["interactive_wait"]:
+        return  # not in interactive mode
+    data = controller["interactive_wait"][uid]
+    text = message.text.strip()
+    if data["step"] == 1:
+        first_id = parse_msgid_from_link(text)
+        if not first_id:
+            await message.reply_text("Couldn't parse first link. Send a link like https://t.me/c/3240589036/340")
+            return
+        data["first"] = first_id
+        data["step"] = 2
+        await message.reply_text(f"First id set to {first_id}. Now send LAST message link.")
+        return
+    if data["step"] == 2:
+        last_id = parse_msgid_from_link(text)
+        if not last_id:
+            await message.reply_text("Couldn't parse last link. Send a link like https://t.me/c/3240589036/345")
+            return
+        first_id = data.get("first")
+        if not first_id:
+            await message.reply_text("First id missing, restart with /forward")
+            controller["interactive_wait"].pop(uid, None)
+            return
+        # done: run range forward (ask for confirmation)
+        await message.re
