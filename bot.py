@@ -7,12 +7,12 @@ import os
 
 # -----------------------
 # 🔹 VARIABLES (Pre-Filled)
-API_ID = 28420641
-API_HASH = "d1302d5039ae3275c4195b4fcc5ff1f9"
-BOT_TOKEN = "8592967336:AAGoj5zAzkPO9nHSFjHYHp7JclEq4Z7KKGg"  # ⚠️ Yahan apna working bot token daalna
-SOURCE_CHANNEL = -1003240589036
-TARGET_CHANNELS = [-1003216068164]  # Add more IDs if needed
-OWNER_ID = 8117462619
+API_ID = 24916176
+API_HASH = "15e8847a5d612831b6a42c5f8d846a8a"
+BOT_TOKEN = "8359601755:AAEZTVLTD9YlXbcnoUAt1lfskOJnVmbX2BA"  # ⚠️ Yahan apna working bot token daalna
+SOURCE_CHANNEL = -1003433745100
+TARGET_CHANNELS = [-1003404830427]  # Add more IDs if needed
+OWNER_ID = 1251826930
 CUSTOM_THUMB = "thumb.jpg"
 FORWARD_DELAY = 1.5
 
