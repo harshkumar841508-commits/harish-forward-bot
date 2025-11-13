@@ -1,5 +1,16 @@
-# bot.py  -- V12 Multi-User Panel (single-file)
-# Features: multi-user, per-user config, range/link forward, persistence, optional user session for private channels.
+# ============================================================
+# V12 ULTRA MULTI-USER BOT — FINAL MERGED bot.py
+# Features:
+# - Multi-user panel (owner can add users, set quotas)
+# - Interactive /range (first->last) and /linkforward
+# - Per-user configs (targets, signature, thumb, delay, concurrency)
+# - Pause / Resume / Stop
+# - Progress messages with safe_edit (no MESSAGE_NOT_MODIFIED)
+# - Exact-size forwarding (download & send as document/video)
+# - Retry, FloodWait handling, adaptive wait per-target
+# - Persistence: config (v12_config.json) and state (v12_state.json)
+# - Health server (optional), export/import state
+# ============================================================
 
 import os
 import re
@@ -7,56 +18,47 @@ import json
 import time
 import asyncio
 import random
-import logging
 import tempfile
+import signal
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
 
-# ---------------------------
-# CONFIG (defaults included; override with ENV)
-# ---------------------------
-API_ID = int(os.getenv("API_ID", "24916176"))
-API_HASH = os.getenv("API_HASH", "15e8847a5d612831b6a42c5f8d846a8a")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8359601755:AAEZTVLTD9YlXbcnoUAt1lfskOJnVmbX2BA")  # recommended: set in Heroku config vars
+# -----------------------------
+# FIXED GLOBAL VARIABLES (YOURS)
+# -----------------------------
+API_ID = 24916176
+API_HASH = "15e8847a5d612831b6a42c5f8d846a8a"
+# Put your bot token here (or use Heroku Config Var BOT_TOKEN)
+BOT_TOKEN = "8359601755:AAEZTVLTD9YlXbcnoUAt1lfskOJnVmbX2BA"
 
-OWNER_ID = int(os.getenv("OWNER_ID", "1251826930"))  # your owner id
+OWNER_ID = 1251826930
 
-# Default global options
-DEFAULT_SOURCE = int(os.getenv("DEFAULT_SOURCE", "-1003433745100"))
-DEFAULT_TARGETS = [int(x) for x in os.getenv("DEFAULT_TARGETS", "-1003404830427").split(",") if x.strip()]
-DEFAULT_SIGNATURE = os.getenv("DEFAULT_SIGNATURE", "Extracted by➤@course_wale")
-DEFAULT_THUMB = os.getenv("DEFAULT_THUMB", "thumb.jpg")
-DEFAULT_FORWARD_DELAY = float(os.getenv("DEFAULT_FORWARD_DELAY", "0.8"))
-DEFAULT_CONCURRENCY = int(os.getenv("DEFAULT_CONCURRENCY", "4"))
-RETRY_LIMIT = int(os.getenv("RETRY_LIMIT", "4"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "1500"))
+# Default global options (owner can change)
+DEFAULT_SIGNATURE = "Extracted by➤@course_wale"
+DEFAULT_TARGETS = [-1003404830427]
+DEFAULT_DELAY = 1.5
+DEFAULT_CONCURRENCY = 4
+RETRY_LIMIT = 4
+MAX_FILE_MB = 1500
 
-# Optional user session for reading private channels (StringSession)
-USER_SESSION = os.getenv("USER_SESSION", "").strip()
-
-# Files
-USERS_FILE = Path("users.json")
-STATE_FILE = Path("state.json")
 TMP_DIR = Path(tempfile.gettempdir())
+CONFIG_FILE = Path("v12_config.json")
+STATE_FILE = Path("v12_state.json")
 
-# Logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("v12_multiuser")
-
-# ---------------------------
-# Persistence helpers
-# ---------------------------
+# -----------------------------
+# Simple JSON persistence
+# -----------------------------
 def load_json(path: Path, default):
     try:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning("load_json %s failed: %s", path, e)
+    except Exception:
+        pass
     return default
 
 def save_json(path: Path, data):
@@ -65,142 +67,182 @@ def save_json(path: Path, data):
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
     except Exception as e:
-        logger.error("save_json failed %s: %s", path, e)
+        print("save_json error:", e)
 
-# Load persisted data
-_users = load_json(USERS_FILE, {})  # structure: {user_id_str: { "targets":[], "signature":"", "thumb":"", "delay":x, "concurrency":x }}
-_state = load_json(STATE_FILE, {})  # structure for resume tasks
-
-# Ensure owner's config exists
-if str(OWNER_ID) not in _users:
-    _users[str(OWNER_ID)] = {
-        "targets": DEFAULT_TARGETS.copy(),
+# initial config & state
+config = load_json(CONFIG_FILE, {
+    "global": {
         "signature": DEFAULT_SIGNATURE,
-        "thumb": DEFAULT_THUMB,
-        "delay": DEFAULT_FORWARD_DELAY,
-        "concurrency": DEFAULT_CONCURRENCY,
-        "allowed": True,  # owner allowed
-    }
-    save_json(USERS_FILE, _users)
+        "targets": DEFAULT_TARGETS.copy(),
+        "delay": DEFAULT_DELAY,
+        "concurrency": DEFAULT_CONCURRENCY
+    },
+    "users": {}  # user_id_str -> {role,quota,used,expires,targets,signature,thumb,delay,concurrency}
+})
+state = load_json(STATE_FILE, {})
 
-# ---------------------------
-# Pyrogram clients
-# ---------------------------
+# ensure owner exists
+config.setdefault("users", {})
+config["users"].setdefault(str(OWNER_ID), {
+    "role": "owner",
+    "quota": 99999999,
+    "used": 0,
+    "expires": None,
+    "targets": DEFAULT_TARGETS.copy(),
+    "signature": DEFAULT_SIGNATURE,
+    "thumb": None,
+    "delay": DEFAULT_DELAY,
+    "concurrency": DEFAULT_CONCURRENCY
+})
+save_json(CONFIG_FILE, config)
+
+# -----------------------------
+# Metrics & Controller
+# -----------------------------
+metrics = {"forwards": 0, "fails": 0, "retries": 0, "active_tasks": 0}
+controller = {
+    "pause_event": asyncio.Event(),
+    "stop_flag": False,
+    "range_task": None,
+    "interactive": {}  # per-user interactive state
+}
+controller["pause_event"].set()
+
+# -----------------------------
+# Pyrogram client
+# -----------------------------
 if not BOT_TOKEN:
-    logger.critical("BOT_TOKEN missing. Set BOT_TOKEN env var.")
-    raise SystemExit("Missing BOT_TOKEN")
+    raise SystemExit("BOT_TOKEN not set. Put token in BOT_TOKEN variable or use env var.")
 
-bot = Client("v12_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("v12_ultra_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# Optional: If you use a USER_SESSION (StringSession) to read private channels,
+# add code here to initialize a user client. For now we will use bot for reading.
 user_client = None
+USER_SESSION = os.getenv("USER_SESSION", "")
 if USER_SESSION:
     try:
-        user_client = Client(session_name="user_session", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION)
-        logger.info("USER_SESSION enabled")
+        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION)
+        user_client.start()
+        print("User session started for private channel reading.")
     except Exception as e:
-        logger.warning("USER_SESSION init failed: %s", e)
+        print("User session start failed:", e)
         user_client = None
 
-# Controller per-user tasks
-controllers: Dict[str, Dict[str, Any]] = {}  # key = user_id_str -> { "task": asyncio.Task, "pause": asyncio.Event(), "stop": False }
+# -----------------------------
+# Caption Cleaner
+# -----------------------------
+REMOVE_PATTERNS = [
+    r"Extracted\s*by[^\n]*",
+    r"Extracted\s*By[^\n]*",
+    r"@YTBR_67", r"@skillwithgaurav", r"@kamdev5x", r"@skillzoneu"
+]
+OLD_WEBSITE_RE = r"https?://[^\s]*riyasmm\.shop[^\s]*"
+NEW_WEBSITE = "https://bio.link/manmohak"
 
-# Metrics
-metrics = {"forwards": 0, "fails": 0, "retries": 0, "active_tasks": 0}
-
-# ---------------------------
-# Utilities
-# ---------------------------
-def get_user_cfg(user_id: int) -> Dict[str, Any]:
-    key = str(user_id)
-    cfg = _users.get(key)
-    if not cfg:
-        cfg = {
+def get_user_cfg(user_id: int) -> Dict[str,Any]:
+    u = config["users"].get(str(user_id))
+    if not u:
+        # create default
+        config["users"][str(user_id)] = {
+            "role": "user",
+            "quota": 0,
+            "used": 0,
+            "expires": None,
             "targets": DEFAULT_TARGETS.copy(),
             "signature": DEFAULT_SIGNATURE,
-            "thumb": DEFAULT_THUMB,
-            "delay": DEFAULT_FORWARD_DELAY,
-            "concurrency": DEFAULT_CONCURRENCY,
-            "allowed": False
+            "thumb": None,
+            "delay": DEFAULT_DELAY,
+            "concurrency": DEFAULT_CONCURRENCY
         }
-        _users[key] = cfg
-        save_json(USERS_FILE, _users)
-    return cfg
+        save_json(CONFIG_FILE, config)
+        return config["users"][str(user_id)]
+    return u
 
-def set_user_cfg(user_id: int, cfg: Dict[str, Any]):
-    _users[str(user_id)] = cfg
-    save_json(USERS_FILE, _users)
-
-def clean_caption(text: Optional[str], user_id: int) -> str:
-    cfg = get_user_cfg(user_id)
-    sig = cfg.get("signature", DEFAULT_SIGNATURE)
+def clean_caption(text: Optional[str], signature: str) -> str:
     if not text:
-        return sig
+        return signature
     out = text
-    # remove common extracted lines and replace site
-    patterns = [
-        r"Extracted\s*by[^\n]*",
-        r"Extracted\s*By[^\n]*",
-        r"@YTBR_67", r"@skillwithgaurav", r"@kamdev5x", r"@skillzoneu"
-    ]
-    for p in patterns:
+    for p in REMOVE_PATTERNS:
         try:
             out = re.sub(p, "", out, flags=re.IGNORECASE)
         except:
             out = out.replace(p, "")
-    # replace specific website patterns
-    out = re.sub(r"https?://[^\s]*riyasmm\.shop[^\s]*", "https://bio.link/manmohak", out, flags=re.IGNORECASE)
+    out = re.sub(OLD_WEBSITE_RE, NEW_WEBSITE, out, flags=re.IGNORECASE)
     out = out.strip()
-    if sig.lower() not in out.lower():
-        out = f"{out}\n\n{sig}"
-    return re.sub(r"\n{3,}", "\n\n", out)
+    if signature.lower() not in out.lower():
+        out = f"{out}\n\n{signature}"
+    return out
 
-def parse_link(link: str):
-    """
-    Accepts forms:
-    https://t.me/c/<chatid>/<msgid>
-    https://t.me/<username>/<msgid>
-    returns dict with chat_id or username and msg_id
-    """
+# -----------------------------
+# Utilities: parse link, safe_edit
+# -----------------------------
+def parse_link(link: str) -> Optional[Dict[str,Any]]:
     try:
         link = link.strip()
-        if "t.me/" not in link:
-            return None
-        parts = link.split("/")
-        msg_id = int(parts[-1])
-        if "/c/" in link:
-            chat_id = int(parts[-2])
-            return {"chat_id": chat_id, "msg_id": msg_id}
-        else:
-            username = parts[-2]
-            return {"chat_username": username, "msg_id": msg_id}
+        if "t.me/c/" in link:
+            parts = link.split("/")
+            return {"chat_id": int(parts[-2]), "msg_id": int(parts[-1])}
+        if "t.me/" in link:
+            parts = link.split("/")
+            return {"username": parts[-2], "msg_id": int(parts[-1])}
     except Exception:
         return None
+    return None
 
-async def download_media(msg: Message) -> Optional[str]:
-    if not (msg.video or (msg.document and getattr(msg.document, "mime_type","").startswith("video"))):
-        return None
+async def safe_edit(msg: Optional[Message], new_text: str):
+    if msg is None:
+        return
     try:
-        fname = TMP_DIR / f"v12_{msg.chat.id}_{msg.id}_{int(time.time()*1000)}"
-        path = await msg.download(file_name=str(fname))
-        try:
-            size_mb = Path(path).stat().st_size / (1024*1024)
-            if size_mb > MAX_FILE_MB:
-                logger.warning("File too large %.1fMB -> skipping", size_mb)
-                Path(path).unlink(missing_ok=True)
-                return None
-        except Exception:
-            pass
-        return path
-    except Exception as e:
-        logger.warning("download_media failed: %s", e)
-        return None
+        old = getattr(msg, "text", "") or ""
+        if old.strip() == new_text.strip():
+            return
+        await msg.edit_text(new_text)
+    except Exception:
+        # ignore edit errors
+        return
 
-# send with retry and backoff
-async def send_with_retry(client_send: Client, target: int, src_msg: Message, local_path: Optional[str], caption: str, thumb: Optional[str], user_cfg: Dict[str, Any]) -> bool:
+# -----------------------------
+# Download media (exact size)
+# -----------------------------
+async def download_media(msg: Message) -> Optional[str]:
+    try:
+        if msg.video or (msg.document and getattr(msg.document, "mime_type","").startswith("video")):
+            out = TMP_DIR / f"v12_{msg.chat.id}_{msg.id}_{int(time.time()*1000)}"
+            path = await msg.download(file_name=str(out))
+            try:
+                size_mb = Path(path).stat().st_size / (1024*1024)
+                if size_mb > MAX_FILE_MB:
+                    # too large — remove and skip
+                    try: Path(path).unlink()
+                    except: pass
+                    return None
+            except:
+                pass
+            return path
+    except Exception as e:
+        print("download_media error:", e)
+    return None
+
+# -----------------------------
+# Adaptive wait per target
+# -----------------------------
+_last_send_time: Dict[int, float] = {}
+async def adaptive_wait_for_target(target: int, min_interval: float):
+    last = _last_send_time.get(target, 0)
+    elapsed = time.time() - last
+    if elapsed < min_interval:
+        await asyncio.sleep(min_interval - elapsed)
+    _last_send_time[target] = time.time()
+
+# -----------------------------
+# Send with retries + backoff
+# -----------------------------
+async def send_with_retry(client_for_send: Client, target: int, src_msg: Message, local_path: Optional[str], caption: str, thumb: Optional[str]) -> bool:
     attempt = 0
     while attempt < RETRY_LIMIT:
         try:
-            # try copy first (fast)
+            # try copy (fast)
             if local_path is None:
                 try:
                     await src_msg.copy(chat_id=target, caption=caption)
@@ -208,333 +250,306 @@ async def send_with_retry(client_send: Client, target: int, src_msg: Message, lo
                     return True
                 except Exception:
                     pass
-            # else send from file
+            # send local file
             if local_path and Path(local_path).exists():
-                suffix = Path(local_path).suffix.lower()
-                if suffix in [".mp4", ".mkv", ".webm", ".mov"]:
-                    await client_send.send_video(chat_id=target, video=local_path, caption=caption, thumb=thumb if thumb and Path(thumb).exists() else None, supports_streaming=True)
-                else:
-                    await client_send.send_document(chat_id=target, document=local_path, caption=caption)
+                # send as document to preserve exact file
+                await client_for_send.send_document(chat_id=target, document=local_path, caption=caption)
                 metrics["forwards"] += 1
                 return True
-            # fallback to copy (try once)
+            # fallback to copy
             await src_msg.copy(chat_id=target, caption=caption)
             metrics["forwards"] += 1
             return True
         except FloodWait as fw:
             wait = int(getattr(fw, "value", 5)) + 1
-            logger.warning("FloodWait %s", wait)
+            print(f"FloodWait {wait}s while sending to {target}")
             await asyncio.sleep(wait)
         except RPCError as rpc:
-            logger.error("RPCError sending to %s: %s", target, rpc)
+            print("RPCError:", rpc)
             metrics["fails"] += 1
             return False
         except Exception as e:
             attempt += 1
             metrics["retries"] += 1
             backoff = (2 ** attempt) + random.random()
-            logger.warning("send attempt %d to %s failed: %s; backoff %.1f", attempt, target, e, backoff)
+            print(f"send attempt {attempt} failed to {target}: {e} backoff {backoff:.1f}s")
             await asyncio.sleep(backoff)
     metrics["fails"] += 1
     return False
 
-# Adaptive wait per-target to avoid bursts
-_last_send_time: Dict[int, float] = {}
-async def adaptive_wait(target: int, delay_per_forward: float):
-    last = _last_send_time.get(target, 0)
-    elapsed = time.time() - last
-    min_interval = delay_per_forward
-    if elapsed < min_interval:
-        await asyncio.sleep(min_interval - elapsed)
-    _last_send_time[target] = time.time()
+# -----------------------------
+# Forward to multiple targets (concurrent)
+# -----------------------------
+async def forward_to_targets(src_msg: Message, caption: str, targets: List[int], thumb: Optional[str], concurrency: int, delay: float):
+    local_path = None
+    if src_msg.video or (src_msg.document and getattr(src_msg.document,"mime_type","").startswith("video")):
+        local_path = await download_media(src_msg)
 
-# ---------------------------
-# Range worker (per-user)
-# ---------------------------
-async def range_worker_for_user(user_id: int, origin_msg: Message, source_ident: Dict[str, Any], first: int, last: int):
-    user_key = str(user_id)
-    cfg = get_user_cfg(user_id)
-    targets = cfg.get("targets", [])
-    thumb = cfg.get("thumb", DEFAULT_THUMB)
-    delay = cfg.get("delay", DEFAULT_FORWARD_DELAY)
-    concurrency = cfg.get("concurrency", DEFAULT_CONCURRENCY)
-    client_read = user_client if user_client else bot
+    sem = asyncio.Semaphore(concurrency)
+    results: Dict[int,bool] = {}
 
-    # controller init
-    ctrl = controllers.setdefault(user_key, {})
-    pause_ev = ctrl.setdefault("pause", asyncio.Event())
-    pause_ev.set()
-    ctrl.setdefault("stop", False)
+    async def _send_one(tid: int):
+        async with sem:
+            await adaptive_wait_for_target(tid, delay)
+            ok = await send_with_retry(bot, tid, src_msg, local_path, caption, thumb)
+            results[tid] = bool(ok)
+            await asyncio.sleep(0.2)  # small gap between sends
 
+    tasks = [asyncio.create_task(_send_one(int(t))) for t in targets]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # cleanup downloaded file
+    if local_path:
+        try: Path(local_path).unlink()
+        except: pass
+
+    return results
+
+# -----------------------------
+# Range worker (main loop)
+# -----------------------------
+async def range_worker(client_read: Client, origin_msg: Message, source_ident: Dict[str,Any], first: int, last: int, targets: List[int], task_key: str, starter_uid: int):
     metrics["active_tasks"] += 1
     total = last - first + 1
     sent_count = 0
     fail_count = 0
 
-    # progress message
+    # resume from state if exists
+    last_sent = state.get(task_key, {}).get("last_sent", first - 1)
+    start_mid = max(first, last_sent + 1)
+
     try:
-        progress_msg = await origin_msg.reply_text(f"Starting forward {first} → {last} to {len(targets)} targets.")
+        progress_msg = await origin_msg.reply_text(f"Starting forward {start_mid} → {last} (total {total}) to {len(targets)} targets.")
     except Exception:
         progress_msg = None
 
-    # resume info from state
-    task_key = f"{user_key}_{source_ident.get('chat_id', source_ident.get('chat_username'))}_{first}_{last}"
-    last_sent = _state.get(task_key, {}).get("last_sent", first - 1)
-    start_mid = max(first, last_sent + 1)
+    for mid in range(start_mid, last + 1):
+        if controller.get("stop_flag"):
+            try:
+                await safe_edit(progress_msg, f"⛔ Stopped. Sent approx {sent_count}/{total}")
+            except:
+                pass
+            break
 
-    sem = asyncio.Semaphore(concurrency)
+        await controller["pause_event"].wait()
+
+        # fetch message
+        try:
+            if "chat_id" in source_ident:
+                src = await client_read.get_messages(source_ident["chat_id"], mid)
+            else:
+                src = await client_read.get_messages(source_ident["username"], mid)
+        except Exception as e:
+            print("get_messages error:", e)
+            src = None
+
+        # update persisted progress
+        state.setdefault(task_key, {"first": first, "last": last})
+        state[task_key]["last_sent"] = mid
+        save_json(STATE_FILE, state)
+
+        if not src:
+            continue
+        if not (src.video or (src.document and getattr(src.document,"mime_type","").startswith("video"))):
+            continue
+
+        # determine signature / user cfg
+        starter_cfg = get_user_cfg(starter_uid) if str(starter_uid) in config["users"] else None
+        signature = starter_cfg.get("signature") if starter_cfg and starter_cfg.get("signature") else config["global"].get("signature", DEFAULT_SIGNATURE)
+        thumb = starter_cfg.get("thumb") if starter_cfg and starter_cfg.get("thumb") else None
+        concurrency = starter_cfg.get("concurrency") if starter_cfg and starter_cfg.get("concurrency") else config["global"].get("concurrency", DEFAULT_CONCURRENCY)
+        delay = starter_cfg.get("delay") if starter_cfg and starter_cfg.get("delay") else config["global"].get("delay", DEFAULT_DELAY)
+        targets_use = starter_cfg.get("targets") if starter_cfg and starter_cfg.get("targets") else targets
+
+        caption = clean_caption(src.caption or src.text or "", signature)
+
+        results = await forward_to_targets(src, caption, targets_use, thumb, concurrency, delay)
+
+        ok = sum(1 for v in results.values() if v)
+        fails = sum(1 for v in results.values() if not v)
+        sent_count += ok
+        fail_count += fails
+
+        pct = int((mid - first + 1) / total * 100)
+        status_text = f"Forwarded {mid} ({mid-first+1}/{total}) — {pct}%\nSuccess:{ok} Fail:{fails}\nTotal Sent:{sent_count} Total Fail:{fail_count}"
+        try:
+            await safe_edit(progress_msg, status_text)
+        except:
+            pass
+
+        # sleep small delay
+        await asyncio.sleep(delay)
 
     try:
-        for mid in range(start_mid, last + 1):
-            if controllers.get(user_key, {}).get("stop", False):
-                await origin_msg.reply_text("Stopped by user.")
-                break
-            await pause_ev.wait()
-            # fetch message
-            try:
-                if "chat_id" in source_ident:
-                    src = await client_read.get_messages(source_ident["chat_id"], mid)
-                else:
-                    src = await client_read.get_messages(source_ident["chat_username"], mid)
-            except Exception as e:
-                logger.warning("get_messages failed %s:%s -> %s", source_ident, mid, e)
-                src = None
+        await safe_edit(progress_msg, f"✅ Completed. Sent approx {sent_count}/{total} Fail:{fail_count}")
+    except:
+        pass
 
-            # update state even if missing
-            _state.setdefault(task_key, {"first": first, "last": last})
-            _state[task_key]["last_sent"] = mid
-            save_json(STATE_FILE, _state)
+    # cleanup
+    metrics["active_tasks"] -= 1
+    controller["range_task"] = None
+    # remove state for this task
+    try:
+        state.pop(task_key, None)
+        save_json(STATE_FILE, state)
+    except:
+        pass
 
-            if not src:
-                continue
-            # skip non-video
-            if not (src.video or (src.document and getattr(src.document, "mime_type","").startswith("video"))):
-                continue
+# -----------------------------
+# Commands & Handlers
+# -----------------------------
+# Decorator to check owner or allowed user
+def is_owner(uid: int) -> bool:
+    return str(uid) == str(OWNER_ID) or config["users"].get(str(uid), {}).get("role") == "owner"
 
-            caption = clean_caption(src.caption or src.text or "", user_id)
-            local_path = await download_media(src)
-
-            # send concurrently to targets (limited by sem)
-            async def _send_to_target(tid):
-                async with sem:
-                    await adaptive_wait(tid, delay)
-                    ok = await send_with_retry(bot, tid, src, local_path, caption, thumb, cfg)
-                    return ok
-
-            tasks = [asyncio.create_task(_send_to_target(int(t))) for t in targets]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # count
-            ok = sum(1 for r in results if r is True)
-            fails = sum(1 for r in results if r is False or isinstance(r, Exception))
-            sent_count += ok
-            fail_count += fails
-
-            # progress update
-            pct = int((mid - first + 1) / total * 100)
-            text = f"Forwarded {mid} ({mid-first+1}/{total}) — {pct}% — Success:{ok} Fail:{fails}\nTotal Sent:{sent_count} Total Fail:{fail_count}"
-            try:
-                if progress_msg:
-                    await progress_msg.edit_text(text)
-            except Exception:
-                pass
-
-            # cleanup
-            if local_path:
-                try:
-                    Path(local_path).unlink()
-                except:
-                    pass
-
-            # small sleep to avoid bursts
-            await asyncio.sleep(delay)
-
+def has_quota(uid: int, cost: int = 1) -> bool:
+    u = config["users"].get(str(uid))
+    if not u:
+        return False
+    if u.get("expires"):
         try:
-            if progress_msg:
-                await progress_msg.edit_text(f"✅ Completed. Sent approx {sent_count} Fail {fail_count}")
-        except Exception:
-            pass
-
-    except asyncio.CancelledError:
-        try:
-            if progress_msg:
-                await progress_msg.edit_text(f"Cancelled. Sent {sent_count}/{total}")
+            if datetime.fromisoformat(u["expires"]) < datetime.utcnow():
+                return False
         except:
             pass
-    except Exception as e:
-        logger.exception("range_worker error: %s", e)
-        try:
-            if progress_msg:
-                await progress_msg.edit_text(f"❌ Error: {e}")
-        except:
-            pass
-    finally:
-        metrics["active_tasks"] -= 1
-        # clear controller
-        controllers.pop(user_key, None)
+    if u.get("quota", 0) - u.get("used", 0) >= cost:
+        return True
+    return False
 
-# ---------------------------
-# Commands
-# ---------------------------
+def consume_quota(uid: int, cost: int = 1):
+    u = config["users"].setdefault(str(uid), {"role":"user","quota":0,"used":0,"expires":None})
+    u["used"] = u.get("used", 0) + cost
+    save_json(CONFIG_FILE, config)
 
-def is_owner(user_id: int):
-    return int(user_id) == int(OWNER_ID)
+def require_allowed_filter(uid: int) -> bool:
+    return is_owner(uid) or has_quota(uid)
 
+# /start and /help
 @bot.on_message(filters.user(OWNER_ID) & filters.command(["start","help"]))
-async def cmd_start(c, m):
+async def cmd_start_owner(c, m):
     text = (
-        "V12 Multi-User Forward Bot\n\n"
-        "Owner commands:\n"
-        "/adduser <user_id> - allow new user\n"
+        "**V12 Multi-User Forward Bot**\n\n"
+        "Owner Commands:\n"
+        "/adduser <user_id> <quota> [days] — add user\n"
         "/removeuser <user_id>\n"
         "/listusers\n"
-        "/setglobal <option> <value>\n\n"
-        "User commands (after owner adds you):\n"
-        "/myconfig - show your config\n"
-        "/addtarget -100xxx\n"
-        "/removetarget -100xxx\n"
-        "/listtargets\n"
-        "/setsignature <text>\n"
-        "/setthumb (reply to photo)\n"
-        "/range (interactive first+last links)\n"
-        "/linkforward <link1> <link2>\n"
+        "/setglobal <key> <value>\n"
+        "/linkforward <link1> <link2> [targets]\n"
+        "/range — interactive\n"
         "/pause /resume /stop\n"
-        "/status\n"
+        "/exportstate /importstate\n"
+        "/init — start background services\n"
     )
-    await m.reply(text)
+    await m.reply_text(text)
+
+@bot.on_message(filters.command("start") & ~filters.user(OWNER_ID))
+async def cmd_start_user(c, m):
+    await m.reply_text("Hi — If you have been added by owner you can use /range, /linkforward, /status etc. Contact owner to be added.")
 
 # Owner: add user
 @bot.on_message(filters.user(OWNER_ID) & filters.command("adduser"))
 async def cmd_adduser(c, m):
     try:
-        uid = int(m.command[1])
+        uid = str(int(m.command[1]))
+        quota = int(m.command[2]) if len(m.command) > 2 else 100
+        days = int(m.command[3]) if len(m.command) > 3 else None
     except:
-        return await m.reply("Usage: /adduser <user_id>")
-    cfg = {
-        "targets": DEFAULT_TARGETS.copy(),
-        "signature": DEFAULT_SIGNATURE,
-        "thumb": DEFAULT_THUMB,
-        "delay": DEFAULT_FORWARD_DELAY,
-        "concurrency": DEFAULT_CONCURRENCY,
-        "allowed": True
+        return await m.reply_text("Usage: /adduser <user_id> <quota> [days_valid]")
+    expires = None
+    if days:
+        expires = (datetime.utcnow() + timedelta(days=days)).isoformat()
+    config["users"][uid] = {
+        "role": "user", "quota": quota, "used": 0, "expires": expires,
+        "targets": config["global"].get("targets", DEFAULT_TARGETS.copy()),
+        "signature": config["global"].get("signature", DEFAULT_SIGNATURE),
+        "thumb": None, "delay": config["global"].get("delay", DEFAULT_DELAY),
+        "concurrency": config["global"].get("concurrency", DEFAULT_CONCURRENCY)
     }
-    _users[str(uid)] = cfg
-    save_json(USERS_FILE, _users)
-    await m.reply(f"Added user {uid}")
+    save_json(CONFIG_FILE, config)
+    await m.reply_text(f"Added user {uid} quota={quota} expires={expires}")
 
 @bot.on_message(filters.user(OWNER_ID) & filters.command("removeuser"))
 async def cmd_removeuser(c, m):
     try:
-        uid = int(m.command[1])
+        uid = str(int(m.command[1]))
     except:
-        return await m.reply("Usage: /removeuser <user_id>")
-    _users.pop(str(uid), None)
-    save_json(USERS_FILE, _users)
-    await m.reply(f"Removed user {uid}")
+        return await m.reply_text("Usage: /removeuser <user_id>")
+    config["users"].pop(uid, None)
+    save_json(CONFIG_FILE, config)
+    await m.reply_text(f"Removed {uid}")
 
 @bot.on_message(filters.user(OWNER_ID) & filters.command("listusers"))
 async def cmd_listusers(c, m):
-    users_list = [k for k,v in _users.items() if v.get("allowed")]
-    await m.reply("Allowed users:\n" + "\n".join(users_list))
+    lines = []
+    for k,v in config.get("users", {}).items():
+        lines.append(f"{k} role={v.get('role')} quota={v.get('quota')} used={v.get('used')} expires={v.get('expires')}")
+    await m.reply_text("\n".join(lines) if lines else "No users")
 
-# User: get my config
-@bot.on_message(filters.me & filters.command("myconfig") | filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("myconfig"))
+# Per-user config commands
+@bot.on_message(filters.command("myconfig") & filters.private)
 async def cmd_myconfig(c, m):
     uid = m.from_user.id
-    cfg = get_user_cfg(uid)
-    await m.reply(f"Your config:\nTargets: {cfg.get('targets')}\nSignature: {cfg.get('signature')}\nDelay: {cfg.get('delay')}\nConcurrency: {cfg.get('concurrency')}")
+    ucfg = config["users"].get(str(uid))
+    if not ucfg:
+        return await m.reply_text("You are not registered. Contact owner.")
+    await m.reply_text(
+        f"Your config:\nTargets: {ucfg.get('targets')}\nSignature: {ucfg.get('signature')}\nDelay: {ucfg.get('delay')}\nConcurrency: {ucfg.get('concurrency')}\nQuota: {ucfg.get('quota')} Used: {ucfg.get('used')}"
+    )
 
-# addtarget
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("addtarget"))
+@bot.on_message(filters.command("addtarget") & filters.private)
 async def cmd_addtarget(c, m):
     uid = m.from_user.id
-    cfg = get_user_cfg(uid)
+    ucfg = get_user_cfg(uid)
     try:
         tid = int(m.command[1])
     except:
-        return await m.reply("Usage: /addtarget -100xxxxxxxx")
-    pool = cfg.get("targets", [])
+        return await m.reply_text("Usage: /addtarget -100xxxxx")
+    pool = ucfg.get("targets", [])
     if tid in pool:
-        return await m.reply("Already present")
+        return await m.reply_text("Already present")
     pool.append(tid)
-    cfg["targets"] = pool
-    set_user_cfg(uid, cfg)
-    await m.reply(f"Added {tid}")
+    ucfg["targets"] = pool
+    save_json(CONFIG_FILE, config)
+    await m.reply_text(f"Added target {tid}")
 
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("removetarget"))
+@bot.on_message(filters.command("removetarget") & filters.private)
 async def cmd_removetarget(c, m):
     uid = m.from_user.id
-    cfg = get_user_cfg(uid)
+    ucfg = get_user_cfg(uid)
     try:
         tid = int(m.command[1])
     except:
-        return await m.reply("Usage: /removetarget -100xxxxxxxx")
-    pool = cfg.get("targets", [])
+        return await m.reply_text("Usage: /removetarget -100xxxxx")
+    pool = ucfg.get("targets", [])
     if tid in pool:
         pool.remove(tid)
-        cfg["targets"] = pool
-        set_user_cfg(uid, cfg)
-        await m.reply(f"Removed {tid}")
-    else:
-        await m.reply("Not in list")
+        ucfg["targets"] = pool
+        save_json(CONFIG_FILE, config)
+        return await m.reply_text(f"Removed {tid}")
+    return await m.reply_text("Not in list")
 
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("listtargets"))
-async def cmd_listtargets(c, m):
-    uid = m.from_user.id
-    cfg = get_user_cfg(uid)
-    await m.reply(f"Targets: {cfg.get('targets')}")
-
-# setsignature
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("setsignature"))
+@bot.on_message(filters.command("setsignature") & filters.private)
 async def cmd_setsignature(c, m):
     uid = m.from_user.id
     text = " ".join(m.command[1:])
     if not text:
-        return await m.reply("Usage: /setsignature <text>")
-    cfg = get_user_cfg(uid)
-    cfg["signature"] = text
-    set_user_cfg(uid, cfg)
-    await m.reply(f"Signature set to:\n{text}")
+        return await m.reply_text("Usage: /setsignature <text>")
+    ucfg = get_user_cfg(uid)
+    ucfg["signature"] = text
+    save_json(CONFIG_FILE, config)
+    await m.reply_text(f"Signature updated to: {text}")
 
-# setthumb (reply to photo)
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("setthumb"))
+@bot.on_message(filters.command("setthumb") & filters.private)
 async def cmd_setthumb(c, m):
     uid = m.from_user.id
-    if not m.reply_to_message:
-        return await m.reply("Reply to an image with /setthumb")
-    p = await m.reply_to_message.download(file_name=f"thumb_{uid}.jpg")
-    cfg = get_user_cfg(uid)
-    cfg["thumb"] = p
-    set_user_cfg(uid, cfg)
-    await m.reply("Thumbnail updated")
+    if not m.reply_to_message or not (m.reply_to_message.photo or m.reply_to_message.document):
+        return await m.reply_text("Reply to a photo with /setthumb")
+    path = await m.reply_to_message.download(file_name=f"thumb_{uid}.jpg")
+    ucfg = get_user_cfg(uid)
+    ucfg["thumb"] = path
+    save_json(CONFIG_FILE, config)
+    await m.reply_text("Thumbnail updated.")
 
-# pause/resume/stop (per-user)
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("pause"))
-async def cmd_pause(c, m):
-    uid = str(m.from_user.id)
-    ctrl = controllers.setdefault(uid, {})
-    ev = ctrl.setdefault("pause", asyncio.Event())
-    ev.clear()
-    await m.reply("Paused")
-
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("resume"))
-async def cmd_resume(c, m):
-    uid = str(m.from_user.id)
-    ctrl = controllers.setdefault(uid, {})
-    ev = ctrl.setdefault("pause", asyncio.Event())
-    ev.set()
-    await m.reply("Resumed")
-
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("stop"))
-async def cmd_stop(c, m):
-    uid = str(m.from_user.id)
-    ctrl = controllers.setdefault(uid, {})
-    ctrl["stop"] = True
-    await m.reply("Stop signal sent")
-
-# status
-@bot.on_message(filters.user(lambda uid: str(uid) in _users and _users[str(uid)].get("allowed")) & filters.command("status"))
-async def cmd_status(c, m):
-    uid = m.from_user.id
-    cfg = get_user_cfg(uid)
-    await m.reply(f"Targets: {cfg.get('targets')}\nSignature: {cfg.get('signature')}\nDelay:{cfg.get('delay')}\nConcurrency:{cfg.get('concurrency')}\nForwards:{metrics['forwards']} Fails:{metrics['fails']} Active:{metrics['active_ta
+# Owner control: set global option
+@bot.on_message(filters.user(OWNER_ID) & filters.command("setglobal"))
+as
