@@ -1,5 +1,2 @@
 pyrogram
 tgcrypto
-aiohttp
-aiofiles
-python-dotenv
