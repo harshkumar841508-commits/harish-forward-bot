@@ -1,57 +1,51 @@
-# bot.py — V12 ULTRA MAX (HARD-CODED VARS) — Ready for Heroku
-# NOTE: This file contains your secrets (BOT_TOKEN, USER_SESSION, API_HASH etc).
-# Keep it private. Prefer using Heroku Config Vars in production.
+# bot.py - V12 Ultra Max (Heroku-ready)
+# Features:
+# - /start /help
+# - Inline keyboard beginner-friendly UI (Forward, Range Forward, Panel, Settings, Premium)
+# - Range forward by sending TWO links (first last) OR t.me links space-separated
+# - Admin panel: setsource, addtarget, removetarget, setdelay, setconcurrency, pause/resume
+# - Thumbnail set (store as file_id in config)
+# - Uses USER_SESSION (optional) to read private channels
+# - Persists config/state to JSON files
+# - Heroku friendly (env vars)
+# WARNING: keep tokens & session in Heroku Config Vars — do NOT commit to public repo.
 
-import os
-import re
-import json
-import time
-import asyncio
-import random
-import tempfile
-import signal
+import os, json, time, asyncio, random, tempfile
 from pathlib import Path
-from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, RPCError
 
-# -----------------------------
-# HARD-CODED CONFIG (as requested)
-# -----------------------------
-API_ID = 24916176
-API_HASH = "15e8847a5d612831b6a42c5f8d846a8a"
+# -------- CONFIG (use Heroku Config Vars) ----------------
+API_ID = int(os.getenv("API_ID", "24916176"))
+API_HASH = os.getenv("API_HASH", "15e8847a5d612831b6a42c5f8d846a8a")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8226478770:AAH1Zz63qXkdD_jD2n-5xeO4ZfoRKPL6uKk")
+OWNER_ID = int(os.getenv("OWNER_ID", "1251826930"))
 
-# Your Bot token (hard-coded)
-BOT_TOKEN = "8226478770:AAH1Zz63qXkdD_jD2n-5xeO4ZfoRKPL6uKk"
+TARGET_CHANNELS_ENV = os.getenv("TARGET_CHANNELS", "-1003428767711")
+TARGET_CHANNELS = [int(x.strip()) for x in TARGET_CHANNELS_ENV.split(",") if x.strip()]
 
-# Owner (your Telegram user id)
-OWNER_ID = 1251826930
+SOURCE_CHANNEL_ENV = os.getenv("SOURCE_CHANNEL", "-1003175017722")
+# SOURCE_CHANNEL can be int (id) or username string
+try:
+    SOURCE_CHANNEL = int(SOURCE_CHANNEL_ENV)
+except Exception:
+    SOURCE_CHANNEL = SOURCE_CHANNEL_ENV
 
-# Source and default target channels
-SOURCE_CHANNEL = -1003175017722                 # your provided source channel id
-DEFAULT_TARGETS = [-1003428767711]              # your provided default target id(s)
+USER_SESSION = os.getenv("USER_SESSION", "")  # optional user session string
 
-# Optional user session string for reading private channels (hard-coded)
-USER_SESSION = "BQF8MNAAhbMoovGajQnCBIFyLI32AMSA8MFuEgHTNUiobuJb9jP5_GZnuqc75Bws4GMpFzoGDGH8ykeXRL-ieoxskpmslTT0fGu82K1Fc0pl9HpPgTplcZAN5Vz1KprigbcT6uEobAtfF3QWBdmbhaFtPyZUGripqHzH6WHQKvfjEc0B2P3xqfZoFipqBA6jpdcWnvMeAWkN7RIWWP3lflhTK7lGa3ROdf0nJ7ZQG-rlPosG4CZbL72xteLBvECKR2p-O6fEdQ7iCHz0omte-PWdnWbW8HQAv-vWVqq5A_LDIs8RhPyfc4iSvRjNejpwaKaD_Gq1pVQe3lSZuFirhTpZylBK4gAAAABKnVzyAA"
+RETRY_LIMIT = int(os.getenv("RETRY_LIMIT", "4"))
+DEFAULT_DELAY = float(os.getenv("DEFAULT_DELAY", "1.5"))
+DEFAULT_CONCURRENCY = int(os.getenv("DEFAULT_CONCURRENCY", "4"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "1500"))
 
-# Tuning
-DEFAULT_SIGNATURE = "Extracted by➤@course_wale"
-DEFAULT_DELAY = 1.0
-DEFAULT_CONCURRENCY = 4
-RETRY_LIMIT = 4
-MAX_FILE_MB = 1500
-
-# Files + persistence
 TMP_DIR = Path(tempfile.gettempdir())
 CONFIG_FILE = Path("v12_config.json")
 STATE_FILE = Path("v12_state.json")
 
-# -----------------------------
-# Helpers: JSON load / save
-# -----------------------------
+# -------- simple json helpers ----------------
 def load_json(path: Path, default):
     try:
         if path.exists():
@@ -62,176 +56,71 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data):
     try:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         print("save_json error:", e)
 
-# -----------------------------
-# Initial config + state
-# -----------------------------
+# -------- load or init config/state ----------------
 config = load_json(CONFIG_FILE, {
     "global": {
-        "signature": DEFAULT_SIGNATURE,
-        "targets": DEFAULT_TARGETS.copy(),
+        "signature": "Extracted by➤@course_wale",
+        "targets": TARGET_CHANNELS.copy(),
         "delay": DEFAULT_DELAY,
-        "concurrency": DEFAULT_CONCURRENCY
+        "concurrency": DEFAULT_CONCURRENCY,
+        "thumb": None,
+        "premium_enabled": False
     },
     "users": {}
 })
 state = load_json(STATE_FILE, {})
 
-# ensure owner exists
+# ensure owner present
 config.setdefault("users", {})
 config["users"].setdefault(str(OWNER_ID), {
     "role": "owner",
     "quota": 99999999,
     "used": 0,
     "expires": None,
-    "targets": config["global"].get("targets", DEFAULT_TARGETS.copy()),
-    "signature": config["global"].get("signature", DEFAULT_SIGNATURE),
-    "thumb": None,
-    "delay": config["global"].get("delay", DEFAULT_DELAY),
-    "concurrency": config["global"].get("concurrency", DEFAULT_CONCURRENCY)
+    "targets": config["global"].get("targets", TARGET_CHANNELS.copy()),
+    "signature": config["global"].get("signature"),
+    "thumb": config["global"].get("thumb"),
+    "delay": config["global"].get("delay"),
+    "concurrency": config["global"].get("concurrency")
 })
 save_json(CONFIG_FILE, config)
 
-# -----------------------------
-# Metrics & controller
-# -----------------------------
-metrics = {"forwards": 0, "fails": 0, "retries": 0, "active_tasks": 0}
-controller = {
-    "pause_event": asyncio.Event(),
-    "stop_flag": False,
-    "range_task": None,
-    "interactive": {}
-}
-controller["pause_event"].set()
-
-# -----------------------------
-# Pyrogram clients: bot + optional user
-# -----------------------------
-if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN not set in file.")
-
+# -------- clients ----------------
 bot = Client("v12_ultra_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user_client: Optional[Client] = None
 if USER_SESSION:
     try:
-        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION)
+        user_client = Client("v12_user", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION)
         user_client.start()
-        print("User session started — private channel reading enabled.")
+        print("User session started - private channel reading enabled.")
     except Exception as e:
-        print("User session failed:", e)
+        print("User session FAILED:", e)
         user_client = None
 else:
-    print("No USER_SESSION — private channels readable only if bot is member/admin.")
+    print("No USER_SESSION - private channels readable only if bot is member/admin.")
 
-# -----------------------------
-# Caption cleaning / replacements
-# -----------------------------
-REMOVE_PATTERNS = [
-    r"Extracted\s*by[^\n]*",
-    r"Extracted\s*By[^\n]*",
-    r"Extracted By ➤.*",
-    r"@YTBR_67", r"@skillwithgaurav", r"@kamdev5x", r"@skillzoneu"
-]
-OLD_WEBSITE_RE = r"https?://[^\s]*riyasmm\.shop[^\s]*"
-NEW_WEBSITE = "https://bio.link/manmohak"
+# -------- utilities ----------------
+_last_send_time: Dict[int, float] = {}
 
-def get_user_cfg(user_id: int) -> Dict[str, Any]:
-    u = config["users"].get(str(user_id))
-    if not u:
-        config["users"][str(user_id)] = {
-            "role": "user",
-            "quota": 0,
-            "used": 0,
-            "expires": None,
-            "targets": config["global"].get("targets", DEFAULT_TARGETS.copy()),
-            "signature": config["global"].get("signature", DEFAULT_SIGNATURE),
-            "thumb": None,
-            "delay": config["global"].get("delay", DEFAULT_DELAY),
-            "concurrency": config["global"].get("concurrency", DEFAULT_CONCURRENCY)
-        }
-        save_json(CONFIG_FILE, config)
-        return config["users"][str(user_id)]
-    return u
+async def adaptive_wait_for_target(target: int, min_interval: float):
+    last = _last_send_time.get(target, 0)
+    elapsed = time.time() - last
+    if elapsed < min_interval:
+        await asyncio.sleep(min_interval - elapsed)
+    _last_send_time[target] = time.time()
 
-def clean_caption(text: Optional[str], signature: str) -> str:
-    if not text:
-        return signature
-    out = text
-    for pat in REMOVE_PATTERNS:
-        try:
-            out = re.sub(pat, "", out, flags=re.IGNORECASE)
-        except re.error:
-            out = out.replace(pat, "")
-    out = re.sub(OLD_WEBSITE_RE, NEW_WEBSITE, out, flags=re.IGNORECASE)
-    out = out.strip()
-    if signature.lower() not in out.lower():
-        out = f"{out}\n\n{signature}"
-    return re.sub(r"\n{3,}", "\n\n", out)
-
-# -----------------------------
-# Utils: parse links, safe_edit
-# -----------------------------
-def parse_msg_link(link: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse links like:
-      - https://t.me/c/123456/12  -> chat_id = -100123456, msg_id = 12
-      - https://t.me/username/12   -> chat_username, msg_id
-    """
-    try:
-        link = link.strip().split("?")[0].split("#")[0]
-        if "t.me/c/" in link or "telegram.me/c/" in link:
-            parts = [p for p in link.split("/") if p]
-            # find 'c' index
-            for i,p in enumerate(parts):
-                if p == "c" and i+2 < len(parts):
-                    chatnum = parts[i+1]
-                    msgid = parts[i+2]
-                    if chatnum.isdigit() and msgid.isdigit():
-                        return {"chat_id": int(f"-100{chatnum}"), "msg_id": int(msgid)}
-            return None
-        if "t.me/" in link or "telegram.me/" in link:
-            parts = [p for p in link.split("/") if p]
-            if len(parts) >= 2:
-                username = parts[-2]
-                msgid = parts[-1]
-                if msgid.isdigit():
-                    return {"chat_username": username, "msg_id": int(msgid)}
-        # fallback: last two segments
-        parts = [p for p in link.split("/") if p]
-        if len(parts) >= 2 and parts[-1].isdigit():
-            return {"chat_username": parts[-2], "msg_id": int(parts[-1])}
-    except Exception:
-        return None
-    return None
-
-async def safe_edit(msg: Optional[Message], new_text: str):
-    if not msg:
-        return
-    try:
-        old = getattr(msg, "text", "") or ""
-        if old.strip() == new_text.strip():
-            return
-        await msg.edit_text(new_text)
-    except Exception:
-        return
-
-# -----------------------------
-# Download & send (exact size)
-# -----------------------------
 async def download_media(msg: Message) -> Optional[str]:
     try:
         if msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video")):
             out = TMP_DIR / f"v12_{msg.chat.id}_{msg.id}_{int(time.time()*1000)}"
             path = await msg.download(file_name=str(out))
             try:
-                size_mb = Path(path).stat().st_size / (1024*1024)
-                if size_mb > MAX_FILE_MB:
+                if Path(path).stat().st_size / (1024*1024) > MAX_FILE_MB:
                     try: Path(path).unlink()
                     except: pass
                     return None
@@ -242,36 +131,14 @@ async def download_media(msg: Message) -> Optional[str]:
         print("download_media error:", e)
     return None
 
-# adaptive wait per target
-_last_send_time: Dict[int, float] = {}
-async def adaptive_wait_for_target(target: int, min_interval: float):
-    last = _last_send_time.get(target, 0)
-    elapsed = time.time() - last
-    if elapsed < min_interval:
-        await asyncio.sleep(min_interval - elapsed)
-    _last_send_time[target] = time.time()
-
-# send with retries/backoff
 async def send_with_retry(client_for_send: Client, target: int, src_msg: Message, local_path: Optional[str], caption: str) -> bool:
     attempt = 0
     while attempt < RETRY_LIMIT:
         try:
-            # Try copy first
-            if local_path is None:
-                try:
-                    await src_msg.copy(chat_id=target, caption=caption)
-                    metrics["forwards"] += 1
-                    return True
-                except Exception:
-                    pass
-            # send local file (document to keep exact size)
             if local_path and Path(local_path).exists():
                 await client_for_send.send_document(chat_id=target, document=local_path, caption=caption)
-                metrics["forwards"] += 1
                 return True
-            # fallback copy
             await src_msg.copy(chat_id=target, caption=caption)
-            metrics["forwards"] += 1
             return True
         except FloodWait as fw:
             wait = int(getattr(fw, "value", 5)) + 1
@@ -279,19 +146,15 @@ async def send_with_retry(client_for_send: Client, target: int, src_msg: Message
             await asyncio.sleep(wait)
         except RPCError as rpc:
             print("RPCError:", rpc)
-            metrics["fails"] += 1
             return False
         except Exception as e:
             attempt += 1
-            metrics["retries"] += 1
             backoff = (2 ** attempt) + random.random()
             print(f"send attempt {attempt} to {target} failed: {e}; backoff {backoff:.1f}")
             await asyncio.sleep(backoff)
-    metrics["fails"] += 1
     return False
 
-# forward concurrently to multiple targets
-async def forward_to_targets(src_msg: Message, caption: str, targets: List[int], concurrency: int, delay: float, client_for_send: Client = None) -> Dict[int,bool]:
+async def forward_to_targets(src_msg: Message, caption: str, targets: List[int], concurrency: int, delay: float, client_for_send: Client = None) -> Dict[int, bool]:
     if client_for_send is None:
         client_for_send = bot
     local_path = None
@@ -299,7 +162,7 @@ async def forward_to_targets(src_msg: Message, caption: str, targets: List[int],
         local_path = await download_media(src_msg)
 
     sem = asyncio.Semaphore(max(1, concurrency))
-    results: Dict[int,bool] = {}
+    results: Dict[int, bool] = {}
 
     async def _send_one(tid: int):
         async with sem:
@@ -317,7 +180,28 @@ async def forward_to_targets(src_msg: Message, caption: str, targets: List[int],
 
     return results
 
-# fetch source message using user_client (if present) or bot
+def parse_msg_link(link: str) -> Optional[Dict[str, Any]]:
+    try:
+        l = link.strip().split("?")[0].split("#")[0]
+        parts = [p for p in l.split("/") if p]
+        if "t.me" in parts or "telegram.me" in parts:
+            if "c" in parts:
+                idx = parts.index("c")
+                chatnum = parts[idx+1]
+                msgid = parts[idx+2]
+                return {"chat_id": int(f"-100{chatnum}"), "msg_id": int(msgid)}
+            else:
+                username = parts[-2]
+                msgid = parts[-1]
+                return {"chat_username": username, "msg_id": int(msgid)}
+        if parts[0] == "c" and len(parts) >= 3:
+            return {"chat_id": int(f"-100{parts[1]}"), "msg_id": int(parts[2])}
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return {"chat_username": parts[-2], "msg_id": int(parts[-1])}
+    except Exception:
+        return None
+    return None
+
 async def fetch_source_message(source: Dict[str, Any], mid: int) -> Optional[Message]:
     try:
         reader = user_client if user_client else bot
@@ -327,211 +211,258 @@ async def fetch_source_message(source: Dict[str, Any], mid: int) -> Optional[Mes
             return await reader.get_messages(source["chat_username"], mid)
     except Exception as e:
         print("fetch_source_message error:", e)
-        return None
+    return None
 
-# range worker (resume/pause/stop + progress)
-async def range_worker(client_read: Client, origin_msg: Message, source_identifier: Dict[str,Any], first: int, last: int, targets: List[int], task_key: str, starter_uid: int):
-    metrics["active_tasks"] += 1
-    total = last - first + 1
-    sent_total = 0
-    fail_total = 0
+# ------------- UI / keyboards ----------------
+def main_keyboard():
+    kb = [
+        [InlineKeyboardButton("▶ Forward (Link)", callback_data="forward_link"),
+         InlineKeyboardButton("🔁 Range Forward", callback_data="range_forward")],
+        [InlineKeyboardButton("🧰 Panel", callback_data="panel"),
+         InlineKeyboardButton("🖼 Thumbnail", callback_data="thumbnail")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+         InlineKeyboardButton("💎 Premium", callback_data="premium")],
+        [InlineKeyboardButton("📊 Stats", callback_data="stats")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
-    last_sent = state.get(task_key, {}).get("last_sent", first - 1)
-    start_mid = max(first, last_sent + 1)
+# -------- commands -------------
+@bot.on_message(filters.command("start"))
+async def start_cmd(c: Client, m: Message):
+    text = "V12 Ultra Max bot ✅\nUse /help or buttons below.\nSend TWO links (space separated) to range-forward."
+    await m.reply_text(text, reply_markup=main_keyboard())
 
-    user_cfg = get_user_cfg(starter_uid)
-    signature = user_cfg.get("signature", config["global"].get("signature", DEFAULT_SIGNATURE))
-    delay = float(user_cfg.get("delay", config["global"].get("delay", DEFAULT_DELAY)))
-    concurrency = int(user_cfg.get("concurrency", config["global"].get("concurrency", DEFAULT_CONCURRENCY)))
-    targets_use = user_cfg.get("targets", targets)
-
-    try:
-        progress_msg = await origin_msg.reply_text(f"Starting forward {start_mid} → {last} (total {total}) to {len(targets_use)} targets.")
-    except Exception:
-        progress_msg = None
-
-    try:
-        for mid in range(start_mid, last + 1):
-            if controller.get("stop_flag"):
-                controller["stop_flag"] = False
-                await safe_edit(progress_msg, f"⛔ Stopped by owner. Sent: {sent_total}/{total}")
-                break
-
-            await controller["pause_event"].wait()
-
-            src = await fetch_source_message(source_identifier, mid)
-            # persist progress
-            state.setdefault(task_key, {"first": first, "last": last})
-            state[task_key]["last_sent"] = mid
-            save_json(STATE_FILE, state)
-
-            if not src:
-                continue
-            if not (src.video or (src.document and getattr(src.document, "mime_type", "").startswith("video"))):
-                continue
-
-            caption = clean_caption(src.caption or src.text or "", signature)
-
-            sending_client = bot
-            results = await forward_to_targets(src, caption, targets_use, concurrency, delay, client_for_send=sending_client)
-
-            ok = sum(1 for v in results.values() if v)
-            fail = sum(1 for v in results.values() if not v)
-            sent_total += ok
-            fail_total += fail
-
-            pct = int((mid - first + 1) / total * 100)
-            try:
-                await safe_edit(progress_msg, f"Forwarded {mid} ({mid-first+1}/{total}) — {pct}% — Success:{ok} Fail:{fail}\nTotalSent:{sent_total} TotalFail:{fail_total}")
-            except:
-                pass
-
-            await asyncio.sleep(delay)
-        await safe_edit(progress_msg, f"✅ Completed. Sent approx {sent_total}/{total} Fail:{fail_total}")
-    except Exception as e:
-        print("range_worker exception:", e)
-        try:
-            await safe_edit(progress_msg, f"❌ Error: {e}\nSent: {sent_total}/{total}")
-        except:
-            pass
-    finally:
-        metrics["active_tasks"] -= 1
-        controller["range_task"] = None
-        try:
-            state.pop(task_key, None)
-            save_json(STATE_FILE, state)
-        except:
-            pass
-
-# -----------------------------
-# Owner / user helpers
-# -----------------------------
-def is_owner(uid: int) -> bool:
-    return str(uid) == str(OWNER_ID) or config["users"].get(str(uid), {}).get("role") == "owner"
-
-def has_quota(uid: int, cost: int = 1) -> bool:
-    u = config["users"].get(str(uid))
-    if not u:
-        return False
-    if u.get("expires"):
-        try:
-            if datetime.fromisoformat(u["expires"]) < datetime.utcnow():
-                return False
-        except:
-            pass
-    if u.get("quota", 0) - u.get("used", 0) >= cost:
-        return True
-    return False
-
-def consume_quota(uid: int, cost: int = 1):
-    u = config["users"].setdefault(str(uid), {"role":"user","quota":0,"used":0,"expires":None})
-    u["used"] = u.get("used", 0) + cost
-    save_json(CONFIG_FILE, config)
-
-# -----------------------------
-# Commands: owner + users
-# -----------------------------
-@bot.on_message(filters.user(OWNER_ID) & filters.command(["start","help"]))
-async def cmd_start_owner(c, m):
-    text = (
-        "**V12 Ultra Multi-User Forward Bot (Hardcoded)**\n\n"
-        "Owner Commands:\n"
-        "/adduser <user_id> <quota> [days]\n"
-        "/removeuser <user_id>\n"
-        "/listusers\n"
-        "/setglobal <key> <value>\n"
-        "/linkforward <first_link> <last_link> [targets]\n"
-        "/range — interactive\n"
-        "/pause /resume /stop\n"
-        "/exportstate /importstate\n"
-        "/init — start background services\n"
-        "\nUser Commands (private):\n"
-        "/range (interactive)\n"
-        "/linkforward <link1> <link2>\n"
-        "/myconfig\n"
-        "/addtarget /removetarget /listtargets\n"
-        "/setsignature /setthumb\n"
+@bot.on_message(filters.command("help"))
+async def help_cmd(c: Client, m: Message):
+    txt = (
+        "Commands:\n"
+        "/start - start bot\n"
+        "/help - this message\n"
+        "/setsource <link or -100id> - set default source (owner only)\n"
+        "/addtarget <chat_id> - add target (owner only)\n"
+        "/removetarget <chat_id> - remove target (owner only)\n"
+        "/targets - list targets (owner)\n"
+        "/setdelay <seconds> - set global delay (owner)\n"
+        "/setconcurrency <n> - set concurrency (owner)\n"
+        "/pause - pause tasks (owner)\n"
+        "/resume - resume tasks (owner)\n\n"
+        "To quickly forward a range: send TWO links (first last) from same channel:\n"
+        "https://t.me/c/12345/2 https://t.me/c/12345/9"
     )
-    await m.reply_text(text)
+    await m.reply_text(txt, reply_markup=main_keyboard())
 
-@bot.on_message(filters.command("start") & ~filters.user(OWNER_ID))
-async def cmd_start_user(c, m):
-    await m.reply_text("Hello — contact owner to be added. If added, use /range or /linkforward.")
+# -------- callback buttons -------------
+@bot.on_callback_query()
+async def cb_handler(c: Client, cb):
+    data = cb.data or ""
+    if data == "forward_link":
+        await cb.message.reply_text("Send TWO links or FIRST_LINK LAST_LINK (space separated).")
+    elif data == "range_forward":
+        await cb.message.reply_text("Send TWO links (first and last) — bot will forward messages in that range.")
+    elif data == "panel":
+        if int(cb.from_user.id) != OWNER_ID:
+            await cb.answer("Owner only", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Add Target", callback_data="panel_add"), InlineKeyboardButton("Remove Target", callback_data="panel_remove")],
+            [InlineKeyboardButton("Set Source", callback_data="panel_setsource"), InlineKeyboardButton("Set Delay", callback_data="panel_setdelay")],
+            [InlineKeyboardButton("Set Concurrency", callback_data="panel_setconc"), InlineKeyboardButton("Show Targets", callback_data="panel_show")]
+        ])
+        await cb.message.reply_text("Admin Panel:", reply_markup=kb)
+    elif data.startswith("panel_"):
+        await cb.answer("Use commands in chat (owner only).", show_alert=True)
+    elif data == "thumbnail":
+        await cb.message.reply_text("To set thumbnail: send image with caption /setthumb (owner only).")
+    elif data == "settings":
+        await cb.message.reply_text("Settings are admin-only. Use commands.")
+    elif data == "premium":
+        txt = "Premium: Buy to unlock advanced features.\n(Placeholder) Contact @course_wale"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Buy Premium", url="https://t.me/course_wale")]])
+        await cb.message.reply_text(txt, reply_markup=kb)
+    elif data == "stats":
+        txt = f"Targets: {config['global'].get('targets')}\nSource: {SOURCE_CHANNEL}\nDelay: {config['global'].get('delay')}\nConcurrency: {config['global'].get('concurrency')}"
+        await cb.message.reply_text(txt)
+    else:
+        await cb.answer("Not implemented", show_alert=False)
 
-@bot.on_message(filters.user(OWNER_ID) & filters.command("adduser"))
-async def cmd_adduser(c, m):
+# -------- text handler for TWO links -------------
+@bot.on_message(filters.private & filters.text)
+async def two_links_handler(c: Client, m: Message):
+    text = (m.text or "").strip()
+    if not text:
+        return
+    parts = text.split()
+    if len(parts) >= 2:
+        a = parse_msg_link(parts[0])
+        b = parse_msg_link(parts[1])
+        if a and b:
+            # must be same chat
+            if (a.get("chat_id") and b.get("chat_id") and a["chat_id"] == b["chat_id"]) or (a.get("chat_username") and b.get("chat_username") and a["chat_username"] == b["chat_username"]):
+                if a.get("chat_id"):
+                    chat = {"chat_id": a["chat_id"]}
+                else:
+                    chat = {"chat_username": a["chat_username"]}
+                first, last = a["msg_id"], b["msg_id"]
+                if first > last:
+                    first, last = last, first
+                await m.reply_text(f"Starting forward {first} → {last} to {len(config['global'].get('targets',[]))} targets.")
+                sent_total = 0
+                fail_total = 0
+                targets_use = config["global"].get("targets", TARGET_CHANNELS.copy())
+                concurrency = int(config["global"].get("concurrency", DEFAULT_CONCURRENCY))
+                delay = float(config["global"].get("delay", DEFAULT_DELAY))
+                # reader
+                reader = user_client if user_client else bot
+                for mid in range(first, last+1):
+                    try:
+                        src = await fetch_source_message(chat, mid)
+                        if not src:
+                            continue
+                        caption = getattr(src, "caption", None) or (src.text or "")
+                        results = await forward_to_targets(src, caption or "", targets_use, concurrency, delay, client_for_send=bot)
+                        ok = sum(1 for v in results.values() if v)
+                        fail = sum(1 for v in results.values() if not v)
+                        sent_total += ok
+                        fail_total += fail
+                        await asyncio.sleep(delay)
+                    except Exception as e:
+                        print("range forward error:", e)
+                await m.reply_text(f"✅ Completed. Sent approx {sent_total}/{(last-first+1)*len(targets_use)} Fail:{fail_total}")
+                return
+            else:
+                await m.reply_text("Links appear to be from different chats. Provide links from same channel.")
+                return
+    await m.reply_text("Send TWO links or FIRST_LINK LAST_LINK (space separated).")
+
+# -------- owner/admin commands -------------
+def owner_only(func):
+    async def wrapper(c: Client, m: Message):
+        if int(m.from_user.id) != OWNER_ID:
+            await m.reply_text("Owner only.")
+            return
+        await func(c, m)
+    return wrapper
+
+@bot.on_message(filters.command("setsource") & filters.user(OWNER_ID))
+async def setsource_cmd(c: Client, m: Message):
+    if not m.command or len(m.command) < 2:
+        await m.reply_text("Usage: /setsource <t.me link or -100id or username>")
+        return
+    val = m.command[1]
+    parsed = parse_msg_link(val) if "/" in val else None
+    global SOURCE_CHANNEL
     try:
-        uid = str(int(m.command[1]))
-        quota = int(m.command[2]) if len(m.command) > 2 else 100
-        days = int(m.command[3]) if len(m.command) > 3 else None
-    except:
-        return await m.reply_text("Usage: /adduser <user_id> <quota> [days_valid]")
-    expires = None
-    if days:
-        expires = (datetime.utcnow() + timedelta(days=days)).isoformat()
-    config["users"][uid] = {
-        "role": "user",
-        "quota": quota,
-        "used": 0,
-        "expires": expires,
-        "targets": config["global"].get("targets", DEFAULT_TARGETS.copy()),
-        "signature": config["global"].get("signature", DEFAULT_SIGNATURE),
-        "thumb": None,
-        "delay": config["global"].get("delay", DEFAULT_DELAY),
-        "concurrency": config["global"].get("concurrency", DEFAULT_CONCURRENCY)
-    }
-    save_json(CONFIG_FILE, config)
-    await m.reply_text(f"Added user {uid} quota={quota} expires={expires}")
-
-@bot.on_message(filters.user(OWNER_ID) & filters.command("removeuser"))
-async def cmd_removeuser(c, m):
-    try:
-        uid = str(int(m.command[1]))
-    except:
-        return await m.reply_text("Usage: /removeuser <user_id>")
-    config["users"].pop(uid, None)
-    save_json(CONFIG_FILE, config)
-    await m.reply_text(f"Removed {uid}")
-
-@bot.on_message(filters.user(OWNER_ID) & filters.command("listusers"))
-async def cmd_listusers(c, m):
-    lines = []
-    for k, v in config.get("users", {}).items():
-        lines.append(f"{k} role={v.get('role')} quota={v.get('quota')} used={v.get('used')} expires={v.get('expires')}")
-    await m.reply_text("\n".join(lines) if lines else "No users")
-
-@bot.on_message(filters.user(OWNER_ID) & filters.command("setglobal"))
-async def cmd_setglobal(c, m):
-    if len(m.command) < 3:
-        return await m.reply_text("Usage: /setglobal <key> <value>")
-    key = m.command[1].lower()
-    val = " ".join(m.command[2:])
-    if key in ("signature", "delay", "concurrency", "targets"):
-        if key == "delay":
-            try:
-                config["global"]["delay"] = float(val)
-            except:
-                return await m.reply_text("delay must be numeric")
-        elif key == "concurrency":
-            try:
-                config["global"]["concurrency"] = int(val)
-            except:
-                return await m.reply_text("concurrency must be int")
-        elif key == "targets":
-            try:
-                lst = [int(x.strip()) for x in val.split(",") if x.strip()]
-                config["global"]["targets"] = lst
-            except:
-                return await m.reply_text("targets must be comma separated ids")
+        if val.startswith("-100"):
+            SOURCE_CHANNEL = int(val)
+        elif parsed and parsed.get("chat_id"):
+            SOURCE_CHANNEL = parsed.get("chat_id")
+        elif parsed and parsed.get("chat_username"):
+            SOURCE_CHANNEL = parsed.get("chat_username")
         else:
-            config["global"][key] = val
-        save_json(CONFIG_FILE, config)
-        return await m.reply_text(f"Global {key} set to {val}")
-    return await m.reply_text("Allowed keys: signature, delay, concurrency, targets")
+            SOURCE_CHANNEL = val
+        await m.reply_text(f"Source updated to: {SOURCE_CHANNEL}")
+    except Exception as e:
+        await m.reply_text(f"Failed: {e}")
 
-@bot.on_message(filters.command("myconfig") & filters.private)
-async def cmd_myconfig(c, m):
-    uid = m.from_user.id
-    ucfg = config["users"].get(str(uid))
-    if not ucfg:
-        return await m.reply_text("You
+@bot.on_message(filters.command("targets") & filters.user(OWNER_ID))
+async def targets_cmd(c: Client, m: Message):
+    await m.reply_text("Targets:\n" + "\n".join([str(t) for t in config["global"].get("targets", [])]))
+
+@bot.on_message(filters.command("addtarget") & filters.user(OWNER_ID))
+async def addtarget_cmd(c: Client, m: Message):
+    if not m.command or len(m.command) < 2:
+        await m.reply_text("Usage: /addtarget <chat_id>")
+        return
+    try:
+        tid = int(m.command[1])
+        if tid not in config["global"]["targets"]:
+            config["global"]["targets"].append(tid)
+            save_json(CONFIG_FILE, config)
+            await m.reply_text(f"Added target {tid}")
+        else:
+            await m.reply_text("Already exists")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+
+@bot.on_message(filters.command("removetarget") & filters.user(OWNER_ID))
+async def removetarget_cmd(c: Client, m: Message):
+    if not m.command or len(m.command) < 2:
+        await m.reply_text("Usage: /removetarget <chat_id>")
+        return
+    try:
+        tid = int(m.command[1])
+        if tid in config["global"]["targets"]:
+            config["global"]["targets"].remove(tid)
+            save_json(CONFIG_FILE, config)
+            await m.reply_text(f"Removed target {tid}")
+        else:
+            await m.reply_text("Not found")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+
+@bot.on_message(filters.command("setdelay") & filters.user(OWNER_ID))
+async def setdelay_cmd(c: Client, m: Message):
+    if not m.command or len(m.command) < 2:
+        await m.reply_text("Usage: /setdelay <seconds>")
+        return
+    try:
+        d = float(m.command[1])
+        config["global"]["delay"] = d
+        save_json(CONFIG_FILE, config)
+        await m.reply_text(f"Delay set to {d}s")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+
+@bot.on_message(filters.command("setconcurrency") & filters.user(OWNER_ID))
+async def setconc_cmd(c: Client, m: Message):
+    if not m.command or len(m.command) < 2:
+        await m.reply_text("Usage: /setconcurrency <n>")
+        return
+    try:
+        n = int(m.command[1])
+        config["global"]["concurrency"] = n
+        save_json(CONFIG_FILE, config)
+        await m.reply_text(f"Concurrency set to {n}")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+
+@bot.on_message(filters.command("pause") & filters.user(OWNER_ID))
+async def pause_cmd(c: Client, m: Message):
+    # simple: set flag in state
+    state["paused"] = True
+    save_json(STATE_FILE, state)
+    await m.reply_text("All tasks paused.")
+
+@bot.on_message(filters.command("resume") & filters.user(OWNER_ID))
+async def resume_cmd(c: Client, m: Message):
+    state.pop("paused", None)
+    save_json(STATE_FILE, state)
+    await m.reply_text("Resumed.")
+
+@bot.on_message(filters.command("setthumb") & filters.user(OWNER_ID) & filters.photo)
+async def setthumb_cmd(c: Client, m: Message):
+    # owner sends photo with caption /setthumb or just sends photo then /setthumb reply
+    try:
+        photo = m.photo or (m.reply_to_message and m.reply_to_message.photo)
+        if not photo:
+            await m.reply_text("Reply to a photo or send photo with caption /setthumb")
+            return
+        file_id = photo.file_id
+        config["global"]["thumb"] = file_id
+        save_json(CONFIG_FILE, config)
+        await m.reply_text("Thumbnail saved.")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+
+@bot.on_message(filters.command("stats") & filters.user(OWNER_ID))
+async def stats_cmd(c: Client, m: Message):
+    targets = config["global"].get("targets", [])
+    await m.reply_text(f"Targets: {targets}\nSource: {SOURCE_CHANNEL}\nDelay: {config['global'].get('delay')}\nConcurrency: {config['global'].get('concurrency')}")
+
+# -------- startup notice -------------
+@bot.on_message(filters.command("whoami") & filters.user(OWNER_ID))
+async def whoami(c: Client, m: Message):
+    await m.reply_text(f"Bot running. OWNER: {OWNER_ID}\nUSER_SESSION present: {'yes' if USER_SESSION else 'no'}")
+
+# -------- run -------------
+if __na
